@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Idea 蛋 画布（SDK 版）</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2330; --line:#30363d;
+    --txt:#c9d1d9; --muted:#8b949e; --accent:#7c5cff; --accent2:#22d3a6;
+    --egg:#1b2030; --eggHead:#262d40; --danger:#f85149;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;font-family:-apple-system,Segoe UI,Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt);}
+  button{font-family:inherit;cursor:pointer;border:none;border-radius:6px;padding:6px 10px;font-size:12px;background:var(--panel2);color:var(--txt);border:1px solid var(--line);}
+  button:hover{border-color:var(--accent);}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;}
+  button.danger{background:transparent;border-color:var(--danger);color:#f85149;}
+  input,textarea,select{font-family:inherit;background:#0d1117;color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font-size:12px;outline:none;}
+  input:focus,textarea:focus,select:focus{border-color:var(--accent);}
+
+  #topbar{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--panel);border-bottom:1px solid var(--line);position:relative;z-index:30;}
+  #topbar .logo{font-weight:700;color:var(--accent);letter-spacing:.5px;}
+  #topbar .spacer{flex:1;}
+  #topbar .histmode{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);white-space:nowrap;}
+  #topbar .histmode select{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font-size:11px;}
+  #goal{width:280px;}
+  #status{font-size:11px;color:var(--muted);}
+
+  #stage{position:absolute;top:53px;left:0;right:0;bottom:0;overflow:hidden;background:
+     radial-gradient(circle at 1px 1px, #1b2230 1px, transparent 0) 0 0/24px 24px;}
+  #world{position:absolute;left:0;top:0;width:0;height:0;transform-origin:0 0;}
+  #edges{position:absolute;left:0;top:0;width:8000px;height:6000px;overflow:visible;pointer-events:none;}
+  #edges path.edge{pointer-events:stroke;stroke:#52607a;stroke-width:2.5;fill:none;cursor:pointer;transition:stroke .15s;}
+  #edges path.edge:hover{stroke:var(--accent);}
+  #edges path.edge.sel{stroke:var(--accent2);stroke-dasharray:6 4;}
+  #edges path.temp{stroke:var(--accent);stroke-width:2.5;stroke-dasharray:5 4;fill:none;}
+
+  .egg{position:absolute;width:320px;background:var(--egg);border:1px solid var(--line);border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.35);user-select:none;}
+  .egg.sel{border-color:var(--accent2);box-shadow:0 0 0 2px rgba(34,211,166,.35);}
+  .egg .head{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--eggHead);border-radius:12px 12px 0 0;cursor:grab;}
+  .egg .head.drag{cursor:grabbing;}
+  .egg .title{background:transparent;border:none;color:#fff;font-weight:600;font-size:13px;flex:1;min-width:60px;padding:2px 4px;}
+  .egg .badge{font-size:10px;padding:2px 6px;border-radius:10px;background:rgba(124,92,255,.2);color:#b9a6ff;border:1px solid rgba(124,92,255,.4);white-space:nowrap;}
+  /* Selection box (选择以组合): a self-drawn 20px square with a generous
+     32px hit area (the <label> forwards every click inside it to the input),
+     so it is easy to hit even when the egg is small or zoomed out. */
+  .egg .chkwrap{display:inline-flex;align-items:center;justify-content:center;
+    padding:6px;margin:-4px 0 -4px -4px;border-radius:8px;cursor:pointer;
+    flex:0 0 auto;transition:background .15s;}
+  .egg .chkwrap:hover{background:rgba(34,211,166,.14);}
+  .egg .chkwrap:active{background:rgba(34,211,166,.22);}
+  .egg .chk{
+    appearance:none;-webkit-appearance:none;
+    width:20px;height:20px;margin:0;flex:0 0 auto;
+    border:2px solid #6b7891;border-radius:6px;background:rgba(255,255,255,.04);
+    cursor:pointer;position:relative;
+    transform:scale(var(--inv,1));transform-origin:center;
+    transition:border-color .15s,background .15s,transform .12s;
+  }
+  .egg .chk:hover{border-color:var(--accent2);transform:scale(calc(var(--inv,1) * 1.12));}
+  .egg .chk:focus-visible{outline:2px solid var(--accent2);outline-offset:2px;}
+  .egg .chk:checked{background:var(--accent2);border-color:var(--accent2);}
+  .egg .chk:checked::after{
+    content:'';position:absolute;left:5px;top:1px;width:5px;height:10px;
+    border:solid #06281f;border-width:0 2.5px 2.5px 0;transform:rotate(42deg);
+  }
+  .egg .x{background:transparent;border:none;color:var(--muted);font-size:14px;padding:0 2px;}
+  .egg .x:hover{color:#f85149;border:none;}
+
+  .egg .body{padding:10px;display:flex;flex-direction:column;gap:8px;}
+  .egg .lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;}
+  .egg textarea.prompt{width:100%;height:54px;resize:vertical;line-height:1.4;}
+  .egg .msgs{height:140px;overflow:auto;background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px;}
+  .egg .msg{font-size:12px;line-height:1.45;padding:6px 8px;border-radius:8px;max-width:95%;}
+  .egg .msg .who{display:block;font-size:9px;color:var(--muted);margin-bottom:2px;}
+  .egg .msg .body{white-space:pre-wrap;word-break:break-word;}
+  .egg .msg.user{background:rgba(124,92,255,.18);align-self:flex-end;border:1px solid rgba(124,92,255,.35);}
+  .egg .msg.assistant{background:rgba(34,211,166,.12);align-self:flex-start;border:1px solid rgba(34,211,166,.3);}
+  .egg .msg.system{background:rgba(210,153,34,.12);align-self:center;border:1px solid rgba(210,153,34,.3);color:#e3c07a;font-size:11px;}
+  .egg .msg.activity{background:rgba(127,209,255,.10);align-self:center;border:1px dashed rgba(127,209,255,.35);color:#7fd1ff;font-size:11px;opacity:.9;}
+  .egg .cmdrow{display:flex;gap:6px;}
+  .egg .cmdrow input{flex:1;}
+  .egg .cmdrow button.send{flex:0 0 auto;}
+  .egg .cmdrow button.send.stop{width:34px;height:34px;padding:0;background:#c0392b;border-color:#c0392b;color:#fff;font-size:15px;line-height:1;}
+  .egg .cmdrow button.send:disabled{opacity:.5;cursor:not-allowed;}
+  .egg .st{font-size:10px;padding:2px 7px;border-radius:10px;border:1px solid var(--line);white-space:nowrap;}
+  .egg .st.idle{color:#8b98a9;background:#12161f;}
+  .egg .st.plan{color:#e3c07a;background:#2a2410;border-color:#5a4a1a;}
+  .egg .st.intr{color:#ff9b95;background:#2a1414;border-color:#7a2b2b;}
+  .egg .st.run{color:#7fe9c9;background:#0f2a22;border-color:#1f6b56;}
+  .egg.running{border-color:var(--accent);box-shadow:0 0 0 2px rgba(124,92,255,.35);}
+  .egg .acts{display:flex;flex-wrap:wrap;gap:6px;}
+  .egg .acts button{flex:1;min-width:64px;}
+
+  .port{position:absolute;width:14px;height:14px;border-radius:50%;background:var(--panel2);border:2px solid var(--accent);top:14px;cursor:crosshair;z-index:5;}
+  .port.in{left:-8px;}
+  .port.out{right:-8px;border-color:var(--accent2);}
+  .port.out:hover{background:var(--accent2);}
+
+  #commander{position:absolute;top:53px;right:0;bottom:0;width:340px;background:var(--panel);border-left:1px solid var(--line);transform:translateX(100%);transition:transform .2s;display:flex;flex-direction:column;z-index:25;}
+  #commander.open{transform:translateX(0);}
+  #commander .c-head{padding:10px 12px;border-bottom:1px solid var(--line);font-weight:600;display:flex;align-items:center;gap:8px;}
+  #commander .c-head .dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);box-shadow:0 0 8px var(--accent2);}
+  #commander .c-body{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px;}
+  #commander .c-msg{font-size:12px;line-height:1.5;padding:8px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);}
+  #commander .c-msg.c-act{background:#182233;border-style:dashed;color:#9fb0c8;white-space:pre-wrap;}
+  #commander .c-plan{font-size:12px;line-height:1.5;padding:8px 10px;border-radius:8px;background:#1b2436;border:1px solid #2c3a52;margin:2px 0;}
+  #commander .c-plan-h{font-weight:700;color:#7fd1ff;margin-bottom:4px;}
+  #commander .c-plan-step{color:#cdd6e4;line-height:1.6;}
+  #commander .c-plan-step b{color:#fff;}
+  #commander .c-plan-mode{display:inline-block;font-size:11px;font-weight:700;padding:0 6px;border-radius:6px;margin-right:6px;}
+  #commander .c-plan-mode.parallel{color:#7fffd0;background:rgba(127,255,208,.12);}
+  #commander .c-plan-mode.serial{color:#ffd27f;background:rgba(255,210,127,.12);}
+  #commander .c-plan-deliver{color:#c9a6ff;font-size:11px;}
+  #commander .c-plan-notify{color:#7fffd0;font-size:11px;}
+  #commander .c-plan-dep{color:#ffd27f;font-size:11px;}
+  #commander .c-plan-mode.deferred{color:#8a94a6;background:rgba(138,148,166,.12);}
+  #commander .c-plan-step.deferred{color:#7c8798;}
+  #commander .c-foot{padding:10px;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:6px;}
+  #commander select{width:100%;}
+  /* The 总指挥 runs -> its button becomes a red stop square (⏹) that interrupts. */
+  #cmdSend.stop{background:#c0392b;border-color:#c0392b;color:#fff;font-size:15px;line-height:1.1;}
+  #cmdSend:disabled{opacity:.6;cursor:not-allowed;}
+
+  #modal{position:absolute;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:40;}
+  #modal.open{display:flex;}
+  #modal .box{width:680px;max-width:92vw;max-height:84vh;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;}
+  #modal .m-head{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-weight:600;}
+  #modal .m-head .x{margin-left:auto;background:transparent;border:none;color:var(--muted);font-size:16px;}
+  #modal .m-body{flex:1;overflow:auto;display:flex;}
+  #modal .tree{width:200px;border-right:1px solid var(--line);padding:8px;font-size:12px;}
+  #modal .tree .f{padding:4px 6px;border-radius:6px;cursor:pointer;color:var(--muted);word-break:break-all;}
+  #modal .tree .f:hover{background:var(--panel2);color:var(--txt);}
+  #modal .tree .f.active{background:var(--accent);color:#fff;}
+  #modal pre{margin:0;padding:14px;flex:1;overflow:auto;font-size:12px;line-height:1.5;color:#c9d1d9;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;}
+
+  #help{position:absolute;left:12px;bottom:12px;background:rgba(22,27,34,.9);border:1px solid var(--line);border-radius:10px;padding:10px 12px;font-size:11px;color:var(--muted);max-width:260px;line-height:1.6;z-index:20;}
+  #help b{color:var(--txt);}
+  #zoomctl{position:absolute;right:12px;bottom:12px;display:flex;gap:6px;z-index:20;}
+  #zoomctl button{width:32px;height:32px;font-size:16px;}
+  #toast{position:absolute;left:50%;top:14px;transform:translateX(-50%);background:var(--accent);color:#fff;padding:8px 16px;border-radius:20px;font-size:12px;opacity:0;transition:opacity .25s;z-index:50;pointer-events:none;}
+  #toast.show{opacity:1;}
+
+  #traceModal{position:absolute;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:45;}
+  #traceModal.open{display:flex;}
+  #traceModal .box{width:740px;max-width:94vw;max-height:86vh;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;}
+  #traceModal .m-head{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-weight:600;}
+  #traceModal .m-head .x{margin-left:auto;background:transparent;border:none;color:var(--muted);font-size:16px;}
+  #traceModal .m-head .rf{font-size:11px;color:var(--muted);}
+  #traceModal .m-body{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:8px;}
+  #traceModal .tabs{display:flex;gap:6px;padding:8px 12px 0;overflow-x:auto;border-bottom:1px solid var(--line);}
+  #traceModal .ttab{flex:0 0 auto;background:var(--panel2);color:var(--muted);border:1px solid var(--line);border-bottom:none;border-radius:8px 8px 0 0;padding:6px 10px;font-size:11px;white-space:nowrap;cursor:pointer;}
+  #traceModal .ttab:hover{color:var(--txt);}
+  #traceModal .ttab.active{background:var(--accent);color:#fff;border-color:var(--accent);}
+  #traceModal .ttab .k{font-size:9px;opacity:.8;margin-left:4px;}
+  .trace-item{border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#0d1117;}
+  .trace-item .th{display:flex;gap:8px;align-items:center;font-size:10px;color:var(--muted);margin-bottom:4px;}
+  .trace-item .role{font-weight:600;}
+  .trace-item .role.user{color:#b9a6ff;}
+  .trace-item .role.assistant{color:#7fe9c9;}
+  .trace-item .role.tool{color:#e3c07a;}
+  .trace-item .role.system{color:#ff9b95;}
+  .trace-item .kind{padding:1px 6px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);}
+  .trace-item .content{font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-word;}
+  .trace-item .content.prompt{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11px;background:#0a0e14;border:1px solid #1b2230;border-radius:6px;padding:8px;color:#cdd6e4;}
+  .trace-item .content.thought{color:#b9a6ff;font-style:italic;background:#12101c;border:1px solid #2a2540;border-radius:6px;padding:6px;}
+  .trace-item.tcollapsed .content.thought{display:none;}
+  .trace-item .ttoggle{cursor:pointer;}
+  .trace-item .args{font-size:11px;color:var(--muted);margin-top:5px;white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;background:#11161f;border:1px solid var(--line);border-radius:6px;padding:6px;}
+  .trace-item .empty{color:var(--muted);text-align:center;padding:20px;font-size:12px;}
+  #statusModal{position:absolute;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:46;}
+  #statusModal.open{display:flex;}
+  #statusModal .box{width:860px;max-width:96vw;max-height:88vh;background:var(--panel);border:1px solid var(--line);border-radius:12px;display:flex;flex-direction:column;overflow:hidden;}
+  #statusModal .m-head{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-weight:600;}
+  #statusModal .m-head .x{margin-left:auto;background:transparent;border:none;color:var(--muted);font-size:16px;}
+  #statusModal .m-head .rf{font-size:11px;color:var(--muted);}
+  #statusModal .m-body{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;}
+  .st-sec{border:1px solid var(--line);border-radius:10px;padding:10px;background:#0d1117;}
+  .st-sec h4{margin:0 0 8px;font-size:12px;color:var(--muted);font-weight:600;}
+  .st-row{border:1px solid var(--line);border-radius:8px;padding:8px;margin-bottom:8px;background:var(--panel);}
+  .st-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;}
+  .st-pill{font-size:10px;padding:1px 7px;border-radius:10px;border:1px solid var(--line);}
+  .st-pill.success,.st-pill.approved{color:#7fe9c9;background:#0f2a22;border-color:#1f6b56;}
+  .st-pill.failed,.st-pill.canceled,.st-pill.rejected{color:#ff9b95;background:#2a1414;border-color:#7a2b2b;}
+  .st-pill.running{color:#7fd1ff;background:#12202c;border-color:#2c5a7a;}
+  .st-pill.blocked,.st-pill.waiting_approval,.st-pill.pending{color:#e3c07a;background:#2a2410;border-color:#5a4a1a;}
+  .st-pill.planned{color:#8b98a9;background:#12161f;}
+  .st-meta{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5;}
+  .st-reason{font-size:11px;color:#ff9b95;margin-top:4px;}
+  .st-acts{display:flex;gap:6px;margin-top:6px;}
+  .st-acts button{font-size:11px;padding:3px 8px;}
+  .st-metrics{font-size:11px;color:var(--muted);white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace;}
+  #convBadge{font-size:11px;white-space:nowrap;}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <span class="logo">◓ IdeaCanvas</span>
+    <label class="histmode" title="选择已保存的画布会话">画布
+      <select id="sessionSel"><option value="">（新画布）</option></select>
+    </label>
+    <button id="loadBtn">📂 加载</button>
+    <button id="newBtn">🆕 新建</button>
+    <input id="goal" placeholder="输入目标，例如：做一个天气查询机器人" />
+    <button class="primary" id="genBtn">⚡ 生成 idea 蛋</button>
+    <button id="addBtn">＋ 手动加蛋</button>
+    <button id="combineBtn">🧩 组合选中蛋</button>
+    <button id="runBtn" class="primary">▶ 一键运行选中蛋</button>
+    <button id="delEdgeBtn" class="danger">✂ 删除选中连线</button>
+    <button id="clearBtn">🗑 清空</button>
+    <label class="histmode" title="传递会话消息时只传 assistant 的正文；💭思考与🔧工具调用只留在轨迹里">历史范围
+      <select id="histMode">
+        <option value="brief" selected>仅助手正文</option>
+      </select>
+    </label>
+    <label class="histmode" title="捕获并流式展示本地模型的思考过程（reasoning；SDK 默认丢弃，需额外调用一次）"><input type="checkbox" id="reasonChk"/> 💭思考</label>
+    <span class="spacer"></span>
+    <span id="status">连接中…</span>
+    <span id="convBadge"></span>
+    <button id="cmdBtn">🎯 总指挥</button>
+    <button id="statusBtn">📊 状态</button>
+  </div>
+
+  <div id="stage">
+    <div id="world">
+      <svg id="edges"></svg>
+    </div>
+  </div>
+
+  <div id="commander">
+    <div class="c-head"><span class="dot"></span>总指挥 · Commander <button id="cmdTrace" class="primary" style="margin-left:auto;padding:3px 8px;font-size:11px;">📜 轨迹</button></div>
+    <div class="c-body" id="cmdBody">
+      <div class="c-msg"><b>总指挥已就位。</b><br/>在下方下达协调指令，例如「让『数据获取』与『展示』对齐字段」。只有用户连线相连的蛋才会互通消息。</div>
+    </div>
+    <div class="c-foot">
+      <select id="cmdTarget"></select>
+      <textarea id="cmdInput" rows="2" placeholder="向总指挥下达指令…（勾选蛋后，总指挥将直接指挥它们完成）"></textarea>
+      <button class="primary" id="cmdSend">发送协调指令</button>
+    </div>
+  </div>
+
+  <div id="modal">
+    <div class="box">
+      <div class="m-head"><span id="modalTitle">审阅代码</span><button class="x" id="modalX">✕</button></div>
+      <div class="m-body">
+        <div class="tree" id="modalTree"></div>
+        <pre id="modalCode"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="traceModal">
+    <div class="box">
+      <div class="m-head"><span id="traceTitle">全局对话轨迹</span><span class="rf" id="traceConn"></span><button class="x" id="traceX">✕</button></div>
+      <div class="tabs" id="traceTabs"></div>
+      <div class="m-body" id="traceBody"></div>
+    </div>
+  </div>
+
+  <div id="statusModal">
+    <div class="box">
+      <div class="m-head"><span>📊 运行状态</span><span class="rf" id="statusSummary"></span><button class="x" id="statusX">✕</button></div>
+      <div class="m-body" id="statusBody"></div>
+    </div>
+  </div>
+
+  <div id="help">
+    <b>操作提示</b><br/>
+    • 拖拽蛋的<b>标题栏</b>移动<br/>
+    • 从蛋<b>右侧圆点</b>拖到另一蛋连线<br/>
+    • 双击连线可<b>删除</b><br/>
+    • 勾选蛋上的☑后点「组合选中蛋」<br/>
+    • 拖动空白处可<b>平移</b>画布
+  </div>
+  <div id="zoomctl">
+    <button id="zoomIn">＋</button>
+    <button id="zoomOut">－</button>
+    <button id="zoomReset">⤢</button>
+  </div>
+  <div id="toast"></div>
+
+<script>
+const EGG_W = 320, PORT_Y = 21;
+const $ = s => document.querySelector(s);
+const stage = $('#stage'), world = $('#world'), svg = $('#edges');
+
+const state = {
+  eggs: {}, edges: [], selectedEdge: null,
+  connecting: null, draggingEgg: null, panning: null,
+};
+let tx = 60, ty = 40, scale = 1;
+const activeStream = {};   // eggId -> streaming body element
+
+/* ---------- utils ---------- */
+function esc(s){ return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),1800); }
+function applyWorld(){
+  world.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`;
+  // Keep every selection box at a constant SCREEN size: when the canvas is
+  // zoomed out the eggs shrink and the 20px box would become a 6px target.
+  // Counter-scaling (capped, so it never swallows the title) keeps it easy
+  // to hit at any zoom level.
+  const inv = Math.min(1 / (scale || 1), 1.6);
+  for(const el of world.querySelectorAll('.egg .chk')) el.style.setProperty('--inv', inv);
+}
+function screenToWorld(cx, cy){ const r=stage.getBoundingClientRect(); return { x:(cx-r.left-tx)/scale, y:(cy-r.top-ty)/scale }; }
+function edgePath(x1,y1,x2,y2){ const c=Math.max(40,Math.abs(x2-x1)/2); return `M ${x1} ${y1} C ${x1+c} ${y1}, ${x2-c} ${y2}, ${x2} ${y2}`; }
+
+/* ---------- websocket ---------- */
+let ws;
+let currentSessionId = '';
+function connect(){
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = ()=>{
+  $('#status').textContent='已连接';
+  send({type:'sync'}); send({type:'listSessions'});
+  // A dropped connection loses the in-flight realtime stream (tokens + done),
+  // leaving eggs blank / stuck "运行中". Re-loading the current session on
+  // (re)connect backfills every egg's box from the backend transcript and
+  // resets run state to the backend's truth.
+  if(currentSessionId) send({type:'loadSession', sessionId: currentSessionId});
+};
+  ws.onclose = ()=>{ $('#status').textContent='断开，重连中…'; setTimeout(connect, 1500); };
+  ws.onmessage = ev => handle(JSON.parse(ev.data));
+}
+function send(obj){ if(ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+
+function handle(m){
+  switch(m.type){
+    case 'eggs': syncGraph(m.eggs, m.edges); if(m.history_mode) $('#histMode').value=m.history_mode; if(m.reasoning) $('#reasonChk').checked=!!m.reasoning.enabled; if(m.runtime) updateConv(m.runtime); restoreGenBtn(); break;
+    case 'historyMode': $('#histMode').value=m.mode; break;
+    case 'reasoning': $('#reasonChk').checked=!!m.enabled; break;
+    case 'token': {
+      const role = m.role || 'assistant';
+      if(role!=='user' && role!=='assistant'){
+        // A system note (stage header / failure summary): the 轨迹 keeps it,
+        // the chat box stays user + assistant.
+        toast(m.text);
+        if(traceKey===m.eggId) refreshTraceThrottled();
+        break;
+      }
+      appendToken(m.eggId, m.text); if(traceKey===m.eggId) refreshTraceThrottled(); break;
+    }
+    case 'sayBreak': delete activeStream['commander']; cmdActFinish(); break;
+    case 'msg': {
+      const e=state.eggs[m.eggId];
+      const role = m.role || 'user';
+      if(role==='user' || role==='assistant'){ if(e) pushMsg(e, role, m.text); }
+      else { toast(m.text); }
+      break;
+    }
+    case 'plan': {
+      const box=document.createElement('div'); box.className='c-plan';
+      const h=document.createElement('div'); h.className='c-plan-h';
+      h.textContent='🗺 总指挥规划图' + (m.round?('（第 '+m.round+' 轮）'):'');
+      box.appendChild(h);
+      (m.steps||[]).forEach(s=>{
+        const row=document.createElement('div'); row.className='c-plan-step';
+        const deferred=(s.mode==='deferred');
+        if(deferred) row.className+=' deferred';
+        const tag=document.createElement('span');
+        const serial=(s.mode||'parallel')==='serial';
+        tag.className='c-plan-mode '+(deferred?'deferred':(serial?'serial':'parallel'));
+        tag.textContent=deferred?'⏸ 等待依赖':(serial?'→ 串行':'⫼ 并行');
+        const b=document.createElement('b'); b.textContent=s.title||s.egg_id;
+        const t=document.createElement('span'); t.textContent='：'+s.message;
+        row.appendChild(tag); row.appendChild(b); row.appendChild(t);
+        // Authorized hand-off: the commander routed a peer's conclusion to this egg.
+        if(s.deliver && s.deliver.length){
+          const d=document.createElement('span'); d.className='c-plan-deliver';
+          d.textContent='  📮 转交：'+s.deliver.join('、');
+          row.appendChild(d);
+        }
+        // Completion notification: who this egg tells when it finishes.
+        if(s.notify && s.notify.length){
+          const n=document.createElement('span'); n.className='c-plan-notify';
+          n.textContent='  📣 完成后通知：'+s.notify.join('、');
+          row.appendChild(n);
+        }
+        // Dependency: this task waits for another egg's conclusion.
+        if(s.depends_on && s.depends_on.length){
+          const dp=document.createElement('span'); dp.className='c-plan-dep';
+          dp.textContent='  ⛓ 依赖：'+s.depends_on.join('、');
+          row.appendChild(dp);
+        }
+        box.appendChild(row);
+      });
+      $('#cmdBody').appendChild(box); $('#cmdBody').scrollTop=$('#cmdBody').scrollHeight; break;
+    }
+    case 'status': {
+      if(m.eggId==='commander'){ setCmdStatus(m.status); break; }
+      const e=state.eggs[m.eggId]; if(e) setEggStatus(e, m.status); break;
+    }
+    case 'done': {
+      delete activeStream[m.eggId];
+      clearActivity(m.eggId);
+      const e=state.eggs[m.eggId];
+      if(e) setEggStatus(e,'idle');
+      if(m.eggId==='commander'){
+        // The 总指挥 finished (or was interrupted) -> restore the send button.
+        setCmdStatus('idle');
+        // A finished run/plan must never leave an egg stuck 运行中/计划中.
+        for(const id in state.eggs){ const eg=state.eggs[id]; if(eg.running||eg.planned) setEggStatus(eg,'idle'); }
+      } else {
+        // Guarantee the egg panel matches the server transcript (轨迹): the live
+        // stream may have been lost, leaving the panel blank while the trace is
+        // complete. Re-sync from the server on completion.
+        refreshEggPanel(m.eggId);
+      }
+      if(traceKey===m.eggId) fetchTrace(m.eggId);
+      break;
+    }
+    case 'system': {
+      // System notes belong to the 轨迹 — the chat box stays user + assistant.
+      if(m.eggId==='commander'){ toast(m.text); if(traceKey==='commander') fetchTrace('commander'); break; }
+      if(traceKey===m.eggId) fetchTrace(m.eggId);
+      toast(m.text);
+      break;
+    }
+    case 'compressed': { const e=state.eggs[m.eggId]; if(e){ e.messages=[]; toast(m.summary); setEggStatus(e,'idle'); } break; }
+    case 'error': toast('错误: '+m.message); restoreGenBtn(); break;
+    case 'runtime': updateConv(m); if($('#statusModal').classList.contains('open')) renderStatus(m); break;
+    case 'completion': updateConv({complete: m.report && m.report.complete, incomplete: (m.report && m.report.pending) || []}); break;
+    case 'approvals': if($('#statusModal').classList.contains('open')) send({type:'runtime'}); break;
+    case 'framework': break;
+    case 'sessions': fillSessionSel(m.sessions); break;
+    case 'history': applyHistory(m.eggId, m.transcript); break;
+    case 'clearHistory': clearHistory(m.eggId); break;
+    case 'session': currentSessionId = m.sessionId || ''; $('#sessionSel').value = currentSessionId; break;
+  }
+}
+
+/* Re-enable the generate button once generation completes (or errors). No-op if
+   it wasn't disabled (e.g. an 'eggs' message from loading a session). */
+function restoreGenBtn(){
+  const btn=$('#genBtn');
+  if(btn.disabled){
+    btn.disabled=false;
+    btn.textContent = btn.dataset.old || '⚡ 生成 idea 蛋';
+  }
+}
+
+/* ---------- session (canvas) persistence UI ---------- */
+function fillSessionSel(sessions){
+  const sel = $('#sessionSel');
+  sel.innerHTML = '<option value="">（新画布）</option>';
+  for(const s of (sessions||[])){
+    const label = (s.label ? s.label + ' · ' : '') + s.created_at + ' · ' + (s.eggs||0) + '蛋';
+    const o = document.createElement('option');
+    o.value = s.id; o.textContent = label;
+    sel.appendChild(o);
+  }
+}
+function transcriptToContent(t){
+  if(t.kind === 'text') return t.text || '';
+  if(t.kind === 'thought') return '💭 ' + (t.text || '');
+  if(t.kind === 'tool_call') return '🔧 调用工具：' + (t.name || '');
+  if(t.kind === 'tool_result') return '↳ 工具结果：' + (t.result || t.error || '');
+  if(t.kind === 'system_prompt' || t.kind === 'tools' || t.kind === 'status' || t.kind === 'plan')
+    return t.text || '';
+  return t.text || '';
+}
+function historyRole(t){ return t.role === 'tool' ? 'system' : t.role; }
+/* The chat panel shows the CONVERSATION only: user + assistant text.
+   💭 thinking, 🔧 tool calls/results, system notes and the status/plan entries
+   live in the 轨迹 (对话轨迹) — never in the chat box. */
+function chatRole(t){
+  return !!(t && t.kind === 'text' && (t.role === 'user' || t.role === 'assistant'));
+}
+function applyHistory(eggId, transcript){
+  if(!transcript || !transcript.length) return;
+  /* The chat panel shows the CONVERSATION only: user + assistant text.
+     💭 thinking, 🔧 tool calls/results and system notes live in the 轨迹
+     (对话轨迹) — they are replayed there, never into the chat box. */
+  if(eggId === 'commander'){
+    const body = $('#cmdBody');
+    for(const t of transcript){
+      if(!chatRole(t)) continue;
+      const role = historyRole(t), c = transcriptToContent(t);
+      if(!c) continue;
+      const d = document.createElement('div');
+      d.className = 'c-msg';
+      const who = document.createElement('b');
+      who.textContent = (role==='user'?'你：':'总指挥：');
+      d.appendChild(who); d.appendChild(document.createTextNode(c));
+      body.appendChild(d);
+    }
+    body.scrollTop = body.scrollHeight;
+    cmdActFinish();
+    delete activeStream['commander'];
+    return;
+  }
+  const e = state.eggs[eggId];
+  if(!e) return;
+  e.messages = [];
+  for(const t of transcript){
+    if(!chatRole(t)) continue;
+    const c = transcriptToContent(t);
+    if(c) e.messages.push({role: historyRole(t), content: c});
+  }
+  renderMsgs(e);
+}
+/* Wipe a displayed conversation (used when a fresh session is created/loaded so
+   the panel doesn't keep showing the previous idea's history). For the
+   commander we re-seed the welcome message for a clean slate. */
+function clearHistory(eggId){
+  if(eggId === 'commander'){
+    const body = $('#cmdBody');
+    body.innerHTML = '';
+    const d = document.createElement('div');
+    d.className = 'c-msg';
+    d.innerHTML = '<b>总指挥已就位。</b><br/>在下方下达协调指令，例如「让『数据获取』与『展示』对齐字段」。只有用户连线相连的蛋才会互通消息。';
+    body.appendChild(d);
+    body.scrollTop = 0;
+    cmdActFinish();
+    delete activeStream['commander'];
+    setCmdStatus('idle');
+    return;
+  }
+  const e = state.eggs[eggId];
+  if(!e) return;
+  e.messages = [];
+  renderMsgs(e);
+}
+$('#loadBtn').addEventListener('click', ()=>{
+  const id = $('#sessionSel').value;
+  if(!id){ toast('请选择要加载的画布会话'); return; }
+  send({type:'loadSession', sessionId: id});
+});
+$('#newBtn').addEventListener('click', ()=>{
+  send({type:'newSession'});
+});
+
+/* ---------- rendering ---------- */
+/* The chat shows ONLY user + assistant (thinking/tool calls/system notes live
+   in the 轨迹). */
+function renderMsgs(egg){
+  const box=egg.el.querySelector('.msgs'); box.innerHTML='';
+  for(const msg of egg.messages){
+    if(msg.role!=='user' && msg.role!=='assistant') continue;
+    const d=document.createElement('div'); d.className='msg '+msg.role;
+    const who = msg.role==='user'?'你':'LLM';
+    d.innerHTML=`<span class="who">${who}</span><span class="body"></span>`;
+    d.querySelector('.body').textContent=msg.content;
+    box.appendChild(d);
+  }
+  box.scrollTop=box.scrollHeight;
+}
+function pushMsg(egg, role, content){
+  // Only the conversation goes into the chat box; system notes are shown as a
+  // toast and stay in the 轨迹.
+  if(role!=='user' && role!=='assistant'){ return null; }
+  egg.messages.push({role, content});
+  renderMsgs(egg);
+  return egg.el.querySelector('.msgs').lastElementChild.querySelector('.body');
+}
+
+function createEggEl(e){
+  const el=document.createElement('div');
+  el.className='egg'; el.dataset.id=e.id;
+  el.style.left=e.x+'px'; el.style.top=e.y+'px';
+  el.innerHTML=`
+    <div class="port in" title="输入（仅相连的蛋可传入）"></div>
+    <div class="port out" title="输出（从此拖出连线）"></div>
+    <div class="head">
+      <label class="chkwrap" title="选择以组合（选中多个蛋后可组合运行）"><input type="checkbox" class="chk"/></label>
+      <input class="title" value="${esc(e.title)}"/>
+      <span class="badge">${e.type}</span>
+      <span class="st idle">空闲</span>
+      <button class="x" title="删除蛋">✕</button>
+    </div>
+    <div class="body">
+      <div><div class="lbl">提示词（LLM 生成）</div>
+        <textarea class="prompt" placeholder="描述该模块的提示词…">${esc(e.prompt)}</textarea></div>
+      <div><div class="lbl">会话</div><div class="msgs"></div></div>
+      <div class="cmdrow"><input class="cmd" placeholder="向该蛋的 LLM 发送命令…"/><button class="primary send">发送</button></div>
+      <div class="acts">
+        <button class="compress">🗜 压缩会话</button>
+        <button class="review">👁 审阅代码</button>
+        <button class="trace">📜 轨迹</button>
+      </div>
+    </div>`;
+  world.appendChild(el);
+  const egg={id:e.id,title:e.title,prompt:e.prompt,type:e.type,x:e.x,y:e.y,parent:e.parent||null,el,selected:false,messages:[]};
+  state.eggs[e.id]=egg;
+
+  el.querySelector('.title').addEventListener('input', ev=> egg.title=ev.target.value);
+  el.querySelector('.prompt').addEventListener('input', ev=> egg.prompt=ev.target.value);
+  el.querySelector('.chk').addEventListener('change', ev=>{ egg.selected=ev.target.checked; el.classList.toggle('sel', egg.selected); });
+  el.querySelector('.x').addEventListener('click', ()=> send({type:'deleteEgg', id:egg.id}));
+
+  const head=el.querySelector('.head');
+  head.addEventListener('mousedown', ev=>{
+    // The selection box lives in a <label>: exclude it from drag handling so
+    // clicking it never starts a drag of the whole egg.
+    if(ev.target.closest('input,button,label,.port')) return;
+    const w=screenToWorld(ev.clientX,ev.clientY);
+    state.draggingEgg={id:egg.id, offX:w.x-egg.x, offY:w.y-egg.y};
+    head.classList.add('drag'); ev.preventDefault();
+  });
+  el.querySelector('.port.out').addEventListener('mousedown', ev=>{
+    ev.stopPropagation();
+    const w=screenToWorld(ev.clientX,ev.clientY);
+    state.connecting={from:egg.id, x:w.x, y:w.y}; ev.preventDefault();
+  });
+
+  const cmd=el.querySelector('.cmd');
+  const doSend=()=>{
+    if(egg.running){ interruptEgg(egg); return; }   // running -> stop button interrupts
+    const t=cmd.value.trim();
+    const text=t || egg.prompt;   // empty command -> send the egg's prompt
+    if(text) sendCommand(egg, text);
+  };
+  el.querySelector('.send').addEventListener('click', doSend);
+  cmd.addEventListener('keydown', ev=>{ if(ev.key==='Enter' && !egg.running) doSend(); });
+  el.querySelector('.compress').addEventListener('click', ()=>{
+    if(egg.running || egg.planned) return;        // already busy
+    setEggStatus(egg, 'running');                 // 状态 -> 运行中
+    toast('🗜 正在压缩会话…');                     // 系统提示只走 toast，不进会话框
+    send({type:'compress', eggId:egg.id});
+  });
+  el.querySelector('.review').addEventListener('click', ()=> openReview(egg));
+  el.querySelector('.trace').addEventListener('click', ()=> openTrace(egg.id));
+
+  renderMsgs(egg);
+  setEggStatus(egg, 'idle');
+  applyWorld();          // the new selection box must match the current zoom
+}
+
+/* Reflect an egg's run state on its box: 空闲 / 计划中 / 运行中.
+   While running, the send button becomes a square stop (⏹) that interrupts. */
+function setEggStatus(egg, status){
+  egg.running = (status==='running');
+  egg.planned = (status==='planned');
+  const btn=egg.el.querySelector('.send');
+  const badge=egg.el.querySelector('.st');
+  const label = status==='running' ? '运行中' : (status==='planned' ? '计划中' : (status==='interrupting' ? '打断中…' : '空闲'));
+  const cls = status==='running' ? 'run' : (status==='planned' ? 'plan' : (status==='interrupting' ? 'intr' : 'idle'));
+  if(badge){ badge.textContent=label; badge.className='st '+cls; }
+  egg.el.classList.toggle('running', status==='running');
+  if(btn){
+    btn.classList.toggle('stop', status==='running' || status==='interrupting');
+    btn.disabled = (status==='planned' || status==='interrupting');
+    btn.textContent = (status==='running' || status==='interrupting') ? '⏹' : '发送';
+    btn.title = status==='running' ? '打断运行' : (status==='planned' ? '计划中，等待运行' : (status==='interrupting' ? '正在打断…' : '发送命令（空则发送提示词）'));
+  }
+}
+function interruptEgg(egg){
+  setEggStatus(egg, 'interrupting');   // immediate visual feedback
+  fetch('/api/interrupt?egg_id='+encodeURIComponent(egg.id), {method:'POST'})
+    .then(r=>r.ok?r.json():{})
+    .then(j=>{ if(j && j.busy===false) setEggStatus(egg,'idle'); })
+    .catch(()=>{});
+  // Safety net: the backend also emits status/done over WS; if nothing arrives, reset.
+  setTimeout(()=>{
+    const b=egg.el.querySelector('.st');
+    if(b && b.classList.contains('intr')) setEggStatus(egg,'idle');
+  }, 5000);
+}
+
+function syncGraph(eggs, edges){
+  const present=new Set(eggs.map(e=>e.id));
+  for(const id of Object.keys(state.eggs)){
+    if(!present.has(id)){ state.eggs[id].el.remove(); delete state.eggs[id]; delete activeStream[id]; }
+  }
+  for(const e of eggs){
+    const ex=state.eggs[e.id];
+    if(ex){
+      ex.title=e.title; ex.prompt=e.prompt; ex.type=e.type; ex.x=e.x; ex.y=e.y; ex.parent=e.parent||null;
+      ex.el.style.left=e.x+'px'; ex.el.style.top=e.y+'px';
+      ex.el.querySelector('.title').value=e.title;
+      ex.el.querySelector('.prompt').value=e.prompt;
+      ex.el.querySelector('.badge').textContent=e.type;
+      // Re-sync run state from the backend: a stale "运行中" left behind by a
+      // dropped WS stream is cleared here because the backend's egg.busy is the
+      // source of truth (it is False once the run actually finished).
+      setEggStatus(ex, e.running ? 'running' : 'idle');
+    } else {
+      createEggEl(e);
+    }
+  }
+  state.edges=edges||[];
+  refreshCmdTargets();
+  updateEdges();
+}
+
+function updateEdges(){
+  svg.innerHTML='';
+  for(const ed of state.edges){
+    const a=state.eggs[ed.from], b=state.eggs[ed.to];
+    if(!a||!b) continue;
+    const p1={x:a.x+EGG_W, y:a.y+PORT_Y}, p2={x:b.x, y:b.y+PORT_Y};
+    const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d', edgePath(p1.x,p1.y,p2.x,p2.y));
+    path.setAttribute('class','edge'+(state.selectedEdge===ed.id?' sel':''));
+    path.addEventListener('click', ()=>{ state.selectedEdge=(state.selectedEdge===ed.id?null:ed.id); updateEdges(); });
+    path.addEventListener('dblclick', ()=> send({type:'deleteEdge', id:ed.id}));
+    svg.appendChild(path);
+  }
+  if(state.connecting){
+    const a=state.eggs[state.connecting.from];
+    if(a){
+      const p1={x:a.x+EGG_W, y:a.y+PORT_Y};
+      const t=document.createElementNS('http://www.w3.org/2000/svg','path');
+      t.setAttribute('d', edgePath(p1.x,p1.y,state.connecting.x,state.connecting.y));
+      t.setAttribute('class','temp');
+      svg.appendChild(t);
+    }
+  }
+}
+
+/* ---------- streaming tokens ---------- */
+/* The chat (界面) shows user + assistant messages. 💭思考 / 🔧工具调用 live in
+   the 轨迹 (trace) — but DROPPING them here made the window look FROZEN during
+   a long thinking / tool phase. So we surface them as a live "activity" line
+   (思考中 / 调用工具 …) that updates while the turn runs, and remove it as soon
+   as real answer text starts flowing. */
+const activeAct = {};   // eggId -> the activity element
+function setActivity(eggId, text){
+  if(eggId==='commander') return;                 // commander panel has its own flow
+  const egg=state.eggs[eggId]; if(!egg) return;
+  let el=activeAct[eggId];
+  if(!el || !el.isConnected){
+    el=document.createElement('div'); el.className='msg activity';
+    el.innerHTML='<span class="who">进行中</span><span class="body"></span>';
+    egg.el.querySelector('.msgs').appendChild(el);
+    activeAct[eggId]=el;
+  }
+  el.querySelector('.body').textContent=text;
+  const b=egg.el.querySelector('.msgs'); b.scrollTop=b.scrollHeight;
+}
+function clearActivity(eggId){
+  const el=activeAct[eggId];
+  if(el && el.isConnected) el.remove();
+  delete activeAct[eggId];
+}
+/* The 总指挥's panel shows ONLY the conversation (user + assistant). Its 💭
+   thinking and 🔧 tool calls live in the 轨迹 (对话轨迹). */
+const cmdAct = {el:null, buf:'', key:'', count:1};
+/* `stream` = the pieces are one growing text (thinking) -> concatenate.
+   otherwise the pieces are repeated events (tool calls) -> count them. */
+function cmdActFinish(){ cmdAct.el=null; cmdAct.buf=''; cmdAct.key=''; cmdAct.count=1; }
+function appendToken(eggId, text){
+  if(typeof text==='string'){
+    const s=text.trimStart();
+    /* 💭思考 / 🔧工具调用 / ↳工具结果 are NOT chat messages: the 总指挥's panel
+       shows user + assistant only, so they are dropped here — the 轨迹 keeps the
+       full record. An egg still shows a transient "进行中" status line so the
+       window does not look frozen. */
+    if(text.startsWith('💭')){
+      if(eggId!=='commander') setActivity(eggId, '💭 思考中…');
+      return;
+    }
+    if(s.startsWith('🔧')){
+      if(eggId!=='commander') setActivity(eggId, '🔧 调用工具：'+s.replace(/^🔧\s*调用工具：?/,'').trim());
+      return;
+    }
+    if(s.startsWith('↳')){
+      if(eggId!=='commander') setActivity(eggId, '↳ 工具结果已返回');
+      return;
+    }
+  }
+  if(eggId==='commander') cmdActFinish(); else clearActivity(eggId);
+  let body=activeStream[eggId];
+  if(!body || !body.isConnected){
+    if(eggId==='commander'){
+      const d=document.createElement('div'); d.className='c-msg';
+      d.innerHTML='<b>总指挥：</b><span class="b"></span>';
+      $('#cmdBody').appendChild(d); body=d.querySelector('.b');
+    } else {
+      const egg=state.eggs[eggId]; if(!egg) return;
+      egg.messages.push({role:'assistant', content:''});
+      renderMsgs(egg);
+      body=egg.el.querySelector('.msgs').lastElementChild.querySelector('.body');
+    }
+    activeStream[eggId]=body;
+  }
+  body.textContent += text;
+  if(eggId==='commander'){ $('#cmdBody').scrollTop=$('#cmdBody').scrollHeight; }
+  else { const b=state.eggs[eggId].el.querySelector('.msgs'); b.scrollTop=b.scrollHeight; }
+}
+
+/* Rebuild an egg's panel from the server transcript so it always matches 轨迹,
+   even if the live WebSocket stream was lost mid-run (run errored/hung before
+   streaming, or the socket dropped) — otherwise the panel stays blank while the
+   trace is complete and the egg can look stuck 运行中. */
+async function refreshEggPanel(eggId){
+  if(eggId==='commander') return;
+  if(!state.eggs[eggId]) return;
+  try{
+    const r = await fetch('/api/trace/'+encodeURIComponent(eggId));
+    if(!r.ok) return;
+    const d = await r.json();
+    applyHistory(eggId, d.transcript);
+  }catch(e){}
+}
+
+function sendCommand(egg, text){
+  pushMsg(egg,'user',text);
+  egg.el.querySelector('.cmd').value='';
+  setEggStatus(egg,'running');
+  send({type:'command', eggId:egg.id, text});
+}
+
+/* ---------- frontend build stamp (auto-reload after an edit) ---------- */
+/* The served index.html may change while this page stays open (the backend is
+   restarted with new UI code). Polling the build stamp makes the page reload
+   itself, so a stale tab can never keep the OLD behaviour (e.g. the 总指挥
+   button not turning into a stop square) without the user noticing. */
+let appBuild = null;
+window.__appBuild = null;
+function hasPendingInput(){
+  const ci = document.querySelector('#cmdInput');
+  if(ci && ci.value && ci.value.trim()) return true;
+  for(const e of Object.values((window.state && state.eggs) || {})){
+    const i = e.el && e.el.querySelector('.cmd');
+    if(i && i.value && i.value.trim()) return true;
+  }
+  return false;
+}
+async function checkBuild(){
+  try{
+    const r = await fetch('/api/version', {cache:'no-store'});
+    if(!r.ok) return;
+    const j = await r.json();
+    if(window.__appBuild === null){ window.__appBuild = j.build; return; }
+    if(j.build !== window.__appBuild && !hasPendingInput()) location.reload();
+  }catch(e){}
+}
+setInterval(checkBuild, 4000);
+window.addEventListener('focus', checkBuild);
+
+/* ---------- commander ---------- */
+/* The 总指挥 has its own run state (idle / running / interrupting). While it
+   runs, the send button turns into a red stop square (⏹) that interrupts the
+   run — exactly like an egg's stop button. */
+let cmdStatus='idle';
+function setCmdStatus(status){
+  cmdStatus = status||'idle';
+  const btn=$('#cmdSend');
+  const running = (cmdStatus==='running' || cmdStatus==='interrupting');
+  btn.classList.toggle('stop', running);
+  btn.textContent = running ? '⏹' : '发送协调指令';
+  btn.title = running ? '打断总指挥运行' : '发送协调指令';
+  btn.disabled = (cmdStatus==='interrupting');
+}
+function interruptCommander(){
+  setCmdStatus('interrupting');   // immediate visual feedback
+  fetch('/api/interrupt?egg_id=commander', {method:'POST'})
+    .then(r=>r.ok?r.json():{})
+    .then(j=>{ if(j && j.busy===false) setCmdStatus('idle'); })
+    .catch(()=>{});
+  // Safety net: the backend also emits status/done over WS; if nothing arrives, reset.
+  setTimeout(()=>{ if(cmdStatus==='interrupting') setCmdStatus('idle'); }, 5000);
+}
+function refreshCmdTargets(){
+  const sel=$('#cmdTarget'); const cur=sel.value;
+  sel.innerHTML='<option value="">— 全局协调 —</option>';
+  for(const e of Object.values(state.eggs)){ const o=document.createElement('option'); o.value=e.id; o.textContent='蛋：'+e.title; sel.appendChild(o); }
+  sel.value=cur;
+}
+$('#cmdSend').addEventListener('click', ()=>{
+  if(cmdStatus==='running' || cmdStatus==='interrupting'){ interruptCommander(); return; }
+  const txt=$('#cmdInput').value.trim(); if(!txt) return;
+  if(!ws || ws.readyState!==1){ toast('与后台的连接已断开，请稍候重试'); return; }
+  const targets=Object.values(state.eggs).filter(e=>e.selected).map(e=>e.id);
+  const target=$('#cmdTarget').value;
+  const d=document.createElement('div'); d.className='c-msg';
+  const scope = targets.length
+    ? `（将指挥 ${targets.length} 个选中蛋）`
+    : (target ? '（单一目标蛋）' : '（全局协调建议）');
+  d.innerHTML=`<b>你 → 总指挥：</b>${esc(scope)}<br/>${esc(txt)}`;
+  $('#cmdBody').appendChild(d); $('#cmdBody').scrollTop=$('#cmdBody').scrollHeight;
+  $('#cmdInput').value='';
+  setCmdStatus('running');        // the button becomes the stop square right away
+  send({type:'commander', text:txt, target, targets});
+});
+
+/* ---------- review code (worktree) ---------- */
+async function openReview(egg){
+  $('#modalTitle').textContent='审阅代码 · '+egg.title+'（worktree）';
+  const tree=$('#modalTree'), code=$('#modalCode');
+  tree.innerHTML='加载中…'; code.textContent='';
+  const res=await fetch(`/api/egg/${egg.id}/files`);
+  const data=await res.json();
+  tree.innerHTML='';
+  if(!data.files.length){ tree.innerHTML='<div class="f">（空 worktree）</div>'; }
+  data.files.forEach(f=>{
+    const d=document.createElement('div'); d.className='f'; d.textContent=f;
+    d.addEventListener('click', async ()=>{
+      [...tree.children].forEach(c=>c.classList.remove('active')); d.classList.add('active');
+      const r=await fetch(`/api/egg/${egg.id}/file?path=${encodeURIComponent(f)}`);
+      const j=await r.json();
+      code.textContent=j.content||'';
+    });
+    tree.appendChild(d);
+  });
+  $('#modal').classList.add('open');
+}
+$('#modalX').addEventListener('click', ()=> $('#modal').classList.remove('open'));
+$('#modal').addEventListener('click', e=>{ if(e.target.id==='modal') $('#modal').classList.remove('open'); });
+
+/* ---------- topbar actions ---------- */
+$('#genBtn').addEventListener('click', ()=>{
+  const g=$('#goal').value.trim()||'构建一个智能应用';
+  const btn=$('#genBtn');
+  if(btn.disabled) return;           // 已在生成中，避免重复点击
+  btn.dataset.old = btn.textContent;
+  btn.textContent='运行中…';
+  btn.disabled=true;
+  send({type:'generate', goal:g});
+});
+$('#addBtn').addEventListener('click', ()=> send({type:'addEgg', title:'新蛋'}));
+$('#combineBtn').addEventListener('click', ()=>{
+  const ids=Object.values(state.eggs).filter(e=>e.selected).map(e=>e.id);
+  if(!ids.length){ toast('请先勾选要组合的蛋'); return; }
+  send({type:'combine', ids});
+});
+$('#runBtn').addEventListener('click', ()=>{
+  const ids=Object.values(state.eggs).filter(e=>e.selected).map(e=>e.id);
+  if(!ids.length){ toast('请先勾选要运行的蛋'); return; }
+  $('#commander').classList.add('open');   // show the parallel/serial schedule
+  send({type:'run', targets:ids});
+});
+$('#delEdgeBtn').addEventListener('click', ()=>{
+  if(!state.selectedEdge){ toast('请先点选一条连线'); return; }
+  send({type:'deleteEdge', id:state.selectedEdge}); state.selectedEdge=null;
+});
+$('#clearBtn').addEventListener('click', ()=>{
+  if(!confirm('清空整个画布？')) return;
+  for(const id of Object.keys(state.eggs)) send({type:'deleteEgg', id});
+});
+$('#cmdBtn').addEventListener('click', ()=> $('#commander').classList.toggle('open'));
+
+/* ---------- history range (how much session history is inherited) ---------- */
+/* 传递会话消息时永远只传 assistant 的正文：思考(💭)与工具调用(🔧)只留在轨迹。 */
+$('#histMode').addEventListener('change', ev=>{
+  send({type:'setHistoryMode', mode:'brief'});
+  toast('历史范围：仅助手正文（不含思考/工具）');
+});
+$('#reasonChk').addEventListener('change', ev=>{
+  send({type:'setReasoning', on: ev.target.checked});
+  toast(ev.target.checked ? '💭思考：开（将额外流式捕获 reasoning）' : '💭思考：关');
+});
+
+/* ---------- trace (conversation records, time-ordered) ---------- */
+let traceKey = null, traceTimer = null, _traceLast = 0;
+function traceURL(key){ return key==='commander' ? '/api/trace/commander' : `/api/trace/${key}`; }
+function refreshTraceThrottled(){
+  const now=Date.now();
+  if(now-_traceLast>=500){ _traceLast=now; if(traceKey) fetchTrace(traceKey); }
+}
+async function fetchTrace(key){
+  if(!key) return;
+  try{
+    const r=await fetch(traceURL(key));
+    if(r.ok) renderTrace(await r.json(), key);
+  }catch(e){}
+}
+function renderTrace(data, key){
+  const label = key==='commander' ? '总指挥' : (data.title || key);
+  $('#traceTitle').textContent = '对话轨迹 · ' + label;
+  $('#traceConn').textContent = data.connected ? '● 已连接模型' : '○ 未连接模型';
+  const body=$('#traceBody');
+  // Preserve the user's manual scroll position: only auto-follow to the bottom
+  // when the user was already at/near the bottom; otherwise keep them where they
+  // scrolled instead of bouncing back down on every refresh.
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
+  const prevTop = body.scrollTop;
+  body.innerHTML='';
+  // 子蛋与总指挥的轨迹面板都只显示 user / assistant 的非思考记录；
+  // 💭思考、🔧工具调用/结果与 system 记录仍由后端完整返回，只是不在此展示。
+  const list=(data.transcript||[]).filter(it=>
+    it && (it.role==='user'||it.role==='assistant') && it.kind!=='thought');
+  if(!list.length){
+    body.innerHTML='<div class="trace-item"><div class="empty">暂无对话记录。向该蛋发送命令后，这里会按时间顺序显示用户指令与模型回复。</div></div>';
+    return;
+  }
+  for(let idx=0; idx<list.length; idx++){
+    const it=list[idx];
+    const div=document.createElement('div');
+    div.className='trace-item';                  // thoughts start EXPANDED in the trace
+    const ts=(it.ts||'').split('T')[1] || it.ts || '';
+    const KIND_LABEL={user:'用户',system:'系统',assistant:'模型',tool:'工具',thought:'思考',tool_call:'工具调用',tool_result:'工具结果',system_prompt:'系统提示词',tools:'可用工具',prompt:'发送提示词',plan:'指挥计划',status:'状态',phase:'阶段',instruct:'派发指令',report:'子蛋复命'};
+    const kindLabel = KIND_LABEL[it.kind] || it.kind;
+    const roleCls = it.role==='user'?'user':(it.role==='assistant'?'assistant':(it.role==='tool'?'tool':'system'));
+    let head = `<span class="role ${roleCls}">${it.role}</span><span class="kind">${esc(kindLabel)}</span>`;
+    if(it.name) head += `<span class="kind">${esc(it.name)}</span>`;
+    if(it.kind==='thought') head += `<span class="kind ttoggle">▾ 折叠</span>`;
+    head += `<span style="margin-left:auto;">${esc(ts)}</span>`;
+    const isPrompt = it.kind==='system_prompt' || it.kind==='prompt' || it.kind==='tools' || it.kind==='plan';
+    const isThought = it.kind==='thought';
+    let content = it.text!=null ? `<div class="content${isPrompt?' prompt':''}${isThought?' thought':''}">${isThought?'💭 ':''}${esc(it.text)}</div>` : '';
+    let extra='';
+    if(it.kind==='tool_call' && it.args!=null){
+      extra=`<div class="args">参数：${esc(JSON.stringify(it.args,null,2))}</div>`;
+    } else if(it.kind==='tool_result'){
+      const rr = it.error!=null ? ('错误：'+it.error) : (it.result!=null ? JSON.stringify(it.result,null,2) : '');
+      if(rr) extra=`<div class="args">${esc(rr)}</div>`;
+    }
+    div.innerHTML = `<div class="th">${head}</div>${content}${extra}`;
+    if(isThought){
+      div.style.cursor='pointer';
+      const toggle=div.querySelector('.ttoggle');
+      div.addEventListener('click', ()=>{
+        div.classList.toggle('tcollapsed');
+        if(toggle) toggle.textContent = div.classList.contains('tcollapsed') ? '▸ 展开' : '▾ 折叠';
+      });
+    }
+    body.appendChild(div);
+  }
+  if(nearBottom){
+    body.scrollTop=body.scrollHeight;   // follow new content
+  } else {
+    body.scrollTop=prevTop;             // keep the user's manual position
+  }
+}
+/* Build the tab bar: 总指挥 + every egg (idea / sub), clickable to switch. */
+function buildTraceTabs(active){
+  const bar=$('#traceTabs'); bar.innerHTML='';
+  const tabs=[{key:'commander', label:'总指挥', kind:'commander'}];
+  for(const e of Object.values(state.eggs)){
+    tabs.push({key:e.id, label:(e.parent?('↳ '+e.title):e.title), kind:e.type, parent:e.parent});
+  }
+  for(const t of tabs){
+    const b=document.createElement('button');
+    b.className='ttab'+(t.key===active?' active':'');
+    b.dataset.key=t.key;
+    const klabel = t.kind==='idea' ? 'idea' : (t.kind==='commander' ? '指挥' : '子蛋');
+    b.innerHTML = `${esc(t.label)}<span class="k">${klabel}</span>`;
+    b.addEventListener('click', ()=> selectTraceTab(t.key));
+    bar.appendChild(b);
+  }
+}
+function selectTraceTab(key){
+  traceKey=key;
+  [...$('#traceTabs').children].forEach(b=> b.classList.toggle('active', b.dataset.key===key));
+  fetchTrace(key);
+}
+function openTrace(key){
+  traceKey=key;
+  $('#traceModal').classList.add('open');
+  buildTraceTabs(key);
+  selectTraceTab(key);
+  if(traceTimer) clearInterval(traceTimer);
+  traceTimer=setInterval(()=>{ if(traceKey) fetchTrace(traceKey); }, 1500);
+}
+function closeTrace(){
+  $('#traceModal').classList.remove('open');
+  traceKey=null;
+  if(traceTimer){ clearInterval(traceTimer); traceTimer=null; }
+}
+$('#cmdTrace').addEventListener('click', ()=> openTrace('commander'));
+$('#traceX').addEventListener('click', closeTrace);
+$('#traceModal').addEventListener('click', e=>{ if(e.target.id==='traceModal') closeTrace(); });
+
+/* ---------- link.md runtime / approval panel ---------- */
+let statusTimer = null;
+function pillClass(s){ return 'st-pill ' + (s || 'planned'); }
+function renderStatus(d){
+  const tasks = d.tasks || [];
+  const comp = d.completion || {};
+  const approvals = d.approvals || [];
+  const metrics = d.metrics || {};
+  $('#statusSummary').textContent = (comp.complete ? '✅ 已收敛' : '⚠ 未收敛')
+      + ' · 任务 ' + (comp.completed || 0) + '/' + (comp.total || 0)
+      + ' · 运行 ' + ((d.eggs || []).filter(e => e.busy).length)
+      + ' · 阻塞 ' + ((comp.blocked || []).length);
+  let html = '<div class="st-sec"><h4>任务（link.md 三.3 / 五）</h4>';
+  if(!tasks.length){ html += '<div class="st-meta">暂无任务。生成或运行蛋后出现。</div>'; }
+  for(const t of tasks){
+    html += '<div class="st-row"><div class="st-top"><b>' + esc(t.title || t.task_id) + '</b>'
+         + '<span class="' + pillClass(t.status) + '">' + esc(t.status) + '</span>'
+         + (t.required ? '<span class="st-meta">必需</span>' : '<span class="st-meta">可选</span>')
+         + (t.confirmed ? '<span class="st-pill success">已确认</span>' : '')
+         + (t.attempt > 1 ? '<span class="st-meta">尝试 ' + t.attempt + '</span>' : '')
+         + '</div>';
+    html += '<div class="st-meta">验收 ' + (t.acceptance === true ? '通过' : (t.acceptance === false ? '失败' : '未评'))
+         + ' · 复命 ' + (t.report_submitted ? '是' : '否')
+         + ' · 产物 ' + (t.artifacts || []).length
+         + (t.missing && t.missing.length ? ' · 缺失 ' + esc(t.missing.join(',')) : '')
+         + '</div>';
+    if(t.blocked_reason) html += '<div class="st-reason">原因：' + esc(t.blocked_reason) + '</div>';
+    if(t.artifacts && t.artifacts.length){
+      html += '<div class="st-meta">' + t.artifacts.map(function(a){
+        return esc(a.path) + ' v' + a.version + ' [' + esc(a.status) + ']';
+      }).join('<br/>') + '</div>';
+    }
+    html += '<div class="st-acts"><button data-act="request" data-task="' + esc(t.task_id) + '">请求审批</button></div></div>';
+  }
+  html += '</div>';
+
+  html += '<div class="st-sec"><h4>审批（link.md 二.10）</h4>';
+  if(!approvals.length){ html += '<div class="st-meta">暂无审批请求。</div>'; }
+  for(const a of approvals){
+    const cls = a.status === 'approved' ? 'success' : (a.status === 'pending' ? 'waiting_approval' : 'failed');
+    html += '<div class="st-row"><div class="st-top"><b>' + esc(a.task_id) + '</b>'
+         + '<span class="st-pill ' + cls + '">' + esc(a.status) + '</span></div>'
+         + '<div class="st-meta">发起：' + esc(a.requested_by || '') + ' · ' + esc(a.reason || '') + '</div>';
+    if(a.status === 'pending'){
+      html += '<div class="st-acts">'
+           + '<button data-act="approve" data-id="' + esc(a.approval_id) + '">批准</button>'
+           + '<button class="danger" data-act="reject" data-id="' + esc(a.approval_id) + '">拒绝</button>'
+           + '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div>';
+
+  html += '<div class="st-sec"><h4>指标（link.md 二.11）</h4><div class="st-metrics">'
+       + esc(JSON.stringify(metrics, null, 2)) + '</div></div>';
+  $('#statusBody').innerHTML = html;
+}
+function openStatus(){
+  $('#statusModal').classList.add('open');
+  send({type:'runtime'});
+  if(statusTimer) clearInterval(statusTimer);
+  statusTimer = setInterval(function(){
+    if($('#statusModal').classList.contains('open')) send({type:'runtime'});
+  }, 2500);
+}
+function closeStatus(){
+  $('#statusModal').classList.remove('open');
+  if(statusTimer){ clearInterval(statusTimer); statusTimer = null; }
+}
+function updateConv(r){
+  const el = $('#convBadge'); if(!el) return;
+  if(!r || r.complete === undefined){ el.textContent = ''; return; }
+  el.textContent = r.complete ? '✅ 已收敛' : ('⚠ 未收敛 ' + ((r.incomplete || []).length));
+  el.style.color = r.complete ? 'var(--accent2)' : '#e3c07a';
+}
+$('#statusBtn').addEventListener('click', openStatus);
+$('#statusX').addEventListener('click', closeStatus);
+$('#statusModal').addEventListener('click', function(e){ if(e.target.id === 'statusModal') closeStatus(); });
+$('#statusBody').addEventListener('click', function(e){
+  const btn = e.target.closest('button[data-act]'); if(!btn) return;
+  const act = btn.dataset.act;
+  if(act === 'request') send({type:'approvalRequest', eggId: btn.dataset.task, reason: '来自状态面板'});
+  else if(act === 'approve') send({type:'approvalDecide', approvalId: btn.dataset.id, approved: true});
+  else if(act === 'reject') send({type:'approvalDecide', approvalId: btn.dataset.id, approved: false});
+  setTimeout(function(){ if($('#statusModal').classList.contains('open')) send({type:'runtime'}); }, 250);
+});
+
+/* ---------- zoom / pan / drag ---------- */
+$('#zoomIn').addEventListener('click', ()=>{ scale=Math.min(2,scale*1.1); applyWorld(); });
+$('#zoomOut').addEventListener('click', ()=>{ scale=Math.max(0.4,scale/1.1); applyWorld(); });
+$('#zoomReset').addEventListener('click', ()=>{ tx=60;ty=40;scale=1;applyWorld(); });
+
+stage.addEventListener('mousedown', e=>{
+  if(e.target===stage || e.target===world){ state.panning={sx:e.clientX, sy:e.clientY, tx, ty}; }
+});
+window.addEventListener('mousemove', e=>{
+  if(state.panning){ tx=state.panning.tx+(e.clientX-state.panning.sx); ty=state.panning.ty+(e.clientY-state.panning.sy); applyWorld(); return; }
+  if(state.draggingEgg){
+    const w=screenToWorld(e.clientX,e.clientY); const egg=state.eggs[state.draggingEgg.id];
+    egg.x=Math.round(w.x-state.draggingEgg.offX); egg.y=Math.round(w.y-state.draggingEgg.offY);
+    egg.el.style.left=egg.x+'px'; egg.el.style.top=egg.y+'px'; updateEdges(); return;
+  }
+  if(state.connecting){ const w=screenToWorld(e.clientX,e.clientY); state.connecting.x=w.x; state.connecting.y=w.y; updateEdges(); return; }
+});
+window.addEventListener('mouseup', e=>{
+  if(state.draggingEgg){
+    const egg=state.eggs[state.draggingEgg.id];
+    send({type:'move', id:egg.id, x:egg.x, y:egg.y});
+    state.draggingEgg=null; document.querySelectorAll('.egg .head.drag').forEach(h=>h.classList.remove('drag'));
+  }
+  if(state.panning) state.panning=null;
+  if(state.connecting){
+    const w=screenToWorld(e.clientX,e.clientY); let target=null;
+    for(const egg of Object.values(state.eggs)){
+      if(egg.id===state.connecting.from) continue;
+      if(w.x>=egg.x && w.x<=egg.x+EGG_W && w.y>=egg.y && w.y<=egg.y+260){ target=egg.id; break; }
+    }
+    if(target) send({type:'addEdge', from:state.connecting.from, to:target});
+    state.connecting=null; updateEdges();
+  }
+});
+
+connect();
+applyWorld();
+</script>
+</body>
+</html>
