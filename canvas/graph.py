@@ -17,6 +17,7 @@ import asyncio
 import datetime
 import json
 import os
+import inspect
 import re
 import shutil
 import uuid
@@ -36,13 +37,69 @@ PLAN_SCHEMA = {
                 "properties": {
                     "title": {"type": "string"},
                     "prompt": {"type": "string"},
-                    "depends_on": {"type": "string"},
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
                 },
                 "required": ["title", "prompt"],
             },
         }
     },
     "required": ["tasks"],
+}
+
+# The commander (总指挥) uses this schema to decide what to do with an
+# operator message. Instead of blindly forwarding the message to every egg,
+# the commander first reasons about the message and picks an action:
+#   answer   - the message is a question/clarification -> answer it directly
+#   replan   - the message reveals a gap or new requirement -> create new eggs
+#   forward  - the message is relevant to specific eggs -> pass tailored info
+#   run      - the message is an explicit execute command -> run the plan
+COMMANDER_DECISION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["answer", "replan", "forward", "run"],
+        },
+        "reasoning": {"type": "string"},
+        "reply": {"type": "string"},
+        "plan": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "prompt": {"type": "string"},
+                            "depends_on": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["title", "prompt"],
+                    },
+                }
+            },
+        },
+        "targets": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "instructions": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
+        "remove": {
+            "type": "array",
+            "description": "Egg titles or IDs to remove when simplifying/replacing the plan. Only use when the operator explicitly asks to remove or replace existing work.",
+            "items": {"type": "string"},
+        },
+    },
+    "required": ["action", "reasoning", "reply"],
 }
 
 
@@ -72,6 +129,129 @@ def _extract_json(text):
             return obj
     raise ValueError(f"planner reply is not JSON: {raw[:200]!r}")
 
+
+
+async def _response_json(response):
+    """Read JSON from structured output first, then fall back to response text."""
+    errors = []
+    for name in ("structured_output", "parsed"):
+        candidate = getattr(response, name, None)
+        if candidate is None:
+            continue
+        try:
+            if callable(candidate):
+                candidate = candidate()
+            if inspect.isawaitable(candidate):
+                candidate = await candidate
+            if isinstance(candidate, dict):
+                return candidate
+            if isinstance(candidate, str) and candidate.strip():
+                try:
+                    return _extract_json(candidate)
+                except ValueError as exc:
+                    errors.append(str(exc))
+            for converter_name in ("model_dump", "dict"):
+                converter = getattr(candidate, converter_name, None)
+                if callable(converter):
+                    converted = converter()
+                    if isinstance(converted, dict):
+                        return converted
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{name}: {exc}")
+    try:
+        value = getattr(response, "text", None)
+        if callable(value):
+            value = value()
+        if inspect.isawaitable(value):
+            value = await value
+        if isinstance(value, str) and value.strip():
+            return _extract_json(value)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"text: {exc}")
+    detail = "; ".join(errors[-3:])
+    raise ValueError("SDK response did not contain a valid JSON object" +
+                     (f": {detail}" if detail else ""))
+
+
+def _assert_acyclic(nodes, edges):
+    """Return a stable topological order; raise instead of executing a cyclic DAG."""
+    ordered = list(dict.fromkeys(nodes))
+    node_set = set(ordered)
+    adjacency = {node: [] for node in ordered}
+    indegree = {node: 0 for node in ordered}
+    seen = set()
+    for source, target in edges:
+        if source not in node_set or target not in node_set:
+            continue
+        if source == target:
+            raise ValueError(f"dependency cycle: {source} depends on itself")
+        if (source, target) in seen:
+            continue
+        seen.add((source, target))
+        adjacency[source].append(target)
+        indegree[target] += 1
+    ready = [node for node in ordered if indegree[node] == 0]
+    result = []
+    while ready:
+        node = ready.pop(0)
+        result.append(node)
+        for child in adjacency[node]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if len(result) != len(ordered):
+        cyclic = [str(node) for node in ordered if indegree[node] > 0]
+        raise ValueError("dependency cycle detected: " + ", ".join(cyclic))
+    return result
+
+
+def _normalize_plan_items(items, available_titles=None, max_tasks=5, min_tasks=1):
+    """Validate task titles, prompts, prerequisites and cycles before mutation."""
+    if not isinstance(items, list):
+        raise ValueError("plan.tasks must be a list")
+    if not min_tasks <= len(items) <= max_tasks:
+        raise ValueError(f"plan must contain {min_tasks}–{max_tasks} tasks")
+    available = set(available_titles or ())
+    result, titles = [], set()
+    for index, item in enumerate(items):
+        if isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            prompt = str(item.get("prompt") or "").strip()
+            deps = item.get("depends_on") or []
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            title = str(item[0] or "").strip()
+            prompt = str(item[1] or "").strip()
+            deps = item[2] if len(item) > 2 else []
+            deps = deps or []
+        else:
+            raise ValueError(f"task #{index + 1} is not an object")
+        if not title or not prompt:
+            raise ValueError(f"task #{index + 1} needs a non-empty title and prompt")
+        if title in titles:
+            raise ValueError(f"duplicate task title: {title}")
+        if isinstance(deps, str):
+            deps = [deps]
+        if not isinstance(deps, (list, tuple, set)):
+            raise ValueError(f"depends_on for {title!r} must be a list of titles")
+        clean = []
+        for dep in deps:
+            dep = str(dep or "").strip()
+            if not dep:
+                continue
+            if dep == title:
+                raise ValueError(f"task {title!r} cannot depend on itself")
+            if dep not in clean:
+                clean.append(dep)
+        titles.add(title)
+        result.append((title, prompt, clean))
+    known = titles | available
+    for title, _prompt, deps in result:
+        missing = [dep for dep in deps if dep not in known]
+        if missing:
+            raise ValueError(f"task {title!r} references unknown dependencies: {', '.join(missing)}")
+    _assert_acyclic(list(available) + [title for title, _, _ in result],
+                    [(dep, title) for title, _, deps in result for dep in deps])
+    return result
 
 def _env_float(name, default=None):
     raw = (os.environ.get(name) or "").strip()
@@ -105,6 +285,34 @@ class Commander:
         self._agent = None
         self.transcript = []
         self._task = None
+        self._break_pending = False   # next note_say starts a fresh entry
+
+    def note_user(self, text):
+        """Persist a user message so the commander chat survives save/load."""
+        self.transcript.append({
+            "role": "user", "kind": "text", "text": text,
+            "ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
+        })
+
+    def note_say(self, text, role="assistant"):
+        """Persist one narration event; consecutive same-role says merge into a
+        single entry (a logical message streams as many says), say_break forces
+        a new one. role="system" notes become kind="status": they replay in the
+        轨迹 but stay out of the chat panel."""
+        kind = "text" if role in ("user", "assistant") else "status"
+        last = self.transcript[-1] if self.transcript else None
+        if (last and last.get("kind") == kind and last.get("role") == role
+                and not self._break_pending):
+            last["text"] = (last.get("text") or "") + text
+        else:
+            self.transcript.append({
+                "role": role, "kind": kind, "text": text,
+                "ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            })
+        self._break_pending = False
+
+    def note_break(self):
+        self._break_pending = True
 
     def begin_run(self, kind, task):
         self.busy = True
@@ -133,7 +341,7 @@ class Canvas:
         # A single local model server serialises generation anyway and resets
         # connections under two concurrent streams, so default to one egg at a
         # time there; cloud/other backends can really run eggs in parallel.
-        default_conc = "1" if BACKEND == "openai" else "2"
+        default_conc = "2" if BACKEND == "openai" else "4"
         self.max_concurrency = max(
             1, int(os.environ.get("CANVAS_MAX_CONCURRENCY", default_conc)))
         self.max_retries = max(0, int(_env_float("CANVAS_MAX_RETRIES", 1) or 0))
@@ -202,115 +410,136 @@ class Canvas:
     def list_sessions(cls):
         out = []
         for d in sorted(SESSIONS_DIR.glob("*"), reverse=True):
-            if d.is_dir():
-                out.append({
-                    "id": d.name,
-                    "name": d.name,
-                    "mtime": d.stat().st_mtime,
-                })
+            if not d.is_dir():
+                continue
+            # Count eggs from the session's canvas.json (best-effort: a
+            # partially-written file must not break the picker).
+            eggs = 0
+            try:
+                data = json.loads((d / "canvas.json").read_text(encoding="utf-8"))
+                eggs = len(data.get("eggs", []))
+            except Exception:
+                pass
+            # The session id IS the time-based name ("YYYYMMDD-HHMMSS" or
+            # "YYYYMMDD-HHMMSS-N" for same-second collisions). Derive a readable
+            # creation time from it so the picker shows a real timestamp instead
+            # of "undefined".
+            created_at = cls._session_time_label(d.name)
+            out.append({
+                "id": d.name,
+                "name": d.name,
+                "label": "",
+                "created_at": created_at,
+                "eggs": eggs,
+                "mtime": d.stat().st_mtime,
+            })
         return out
+
+    @staticmethod
+    def _session_time_label(name):
+        """Format a session id ("YYYYMMDD-HHMMSS[-N]") as "YYYY-MM-DD HH:MM"."""
+        core = name[:15]  # "YYYYMMDD-HHMMSS"
+        try:
+            return datetime.datetime.strptime(
+                core, "%Y%m%d-%H%M%S").strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            return name
 
     # ---- eggs ----
     async def generate(self, goal):
-        """Decompose the goal into a DAG and create one egg per task.
-
-        link.md 一.1: the commander (not a hard-coded list) decides the split.
-        A real SDK Agent is asked for a JSON plan when a model is available;
-        the fixed seeds remain as an offline fallback so the UI always works.
-        """
+        """Plan and create a validated dependency DAG for the requested goal."""
         goal = (goal or "").strip()
         plan = []
         if goal and SDK_OK:
             try:
                 timeout = _env_float("CANVAS_PLAN_TIMEOUT", 60.0)
-                plan = await asyncio.wait_for(self._plan_with_agent(goal), timeout=timeout)
-            except Exception as exc:  # noqa: BLE001 - planning is best-effort
-                print(f"[canvas] planner unavailable ({exc}); using seeds")
-
+                raw_plan = await asyncio.wait_for(self._plan_with_agent(goal), timeout=timeout)
+                plan = _normalize_plan_items(raw_plan)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[canvas] planner unavailable or invalid ({exc}); using seeds")
+                plan = []
         if not plan:
-            seeds = [
-                ("方案设计", "调研并设计实现方案（架构/接口/风险），产出规格说明 markdown。"),
-                ("编码实现", "按方案实现可运行的代码，写入工作区并验证。"),
-                ("评审验收", "审阅前两个蛋的产出，给出验收意见与改进清单。"),
-            ]
             plan = [
-                (title, f"{base}\n\n项目目标：{goal}" if goal else base, None)
-                for title, base in seeds
+                ("方案设计", "调研并设计实现方案（架构/接口/风险），产出规格说明 markdown。", []),
+                ("编码实现", "按方案实现可运行的代码，写入工作区并验证。", ["方案设计"]),
+                ("评审验收", "审阅方案与代码的实际产出，验证交付物并给出验收意见与改进清单。", ["方案设计", "编码实现"]),
             ]
-
-        created = []
-        by_title = {}
-        for i, item in enumerate(plan):
-            title, prompt = item[0], item[1]
-            egg = await self.add_egg(title, prompt, x=120 + i * 260, y=160)
+            if goal:
+                plan = [(title, f"{prompt}\n\n项目目标：{goal}", deps)
+                        for title, prompt, deps in plan]
+        plan = _normalize_plan_items(plan)
+        created, by_title = [], {}
+        for i, (title, prompt, _deps) in enumerate(plan):
+            row, col = divmod(i, 3)
+            x = 120 + col * 380
+            y = 160 + row * 240
+            egg = await self.add_egg(title, prompt, x=x, y=y)
+            egg = await self.add_egg(title, prompt, x=120 + col * 380, y=160 + row * 240)
             created.append(egg)
             by_title[title] = egg
-
-        linked = False
-        for item, egg in zip(plan, created):
-            dep = item[2] if len(item) > 2 else None
-            if dep and dep in by_title and by_title[dep] is not egg:
-                # edge points from the dependency to the dependent egg
-                await self.add_edge(by_title[dep].id, egg.id)
-                linked = True
-        if not linked and len(created) >= 2:
-            for first, second in zip(created, created[1:]):
-                await self.add_edge(first.id, second.id)
-
-        # Validate the decomposition with the orchestrator primitive.
+        for title, _prompt, deps in plan:
+            for dep in deps:
+                await self.add_edge(by_title[dep].id, by_title[title].id)
         try:
-            parent = models.Task(
-                task_id=f"goal-{uuid.uuid4().hex[:6]}", title="goal",
-                required=False, status=models.TaskStatus.SUCCESS,
-                report_submitted=True, confirmed=True)
+            parent = models.Task(task_id=f"goal-{uuid.uuid4().hex[:6]}", title="goal",
+                                 required=False, status=models.TaskStatus.SUCCESS,
+                                 report_submitted=True, confirmed=True)
             parent.acceptance = models.Acceptance(task_id=parent.task_id, criteria=[])
             parent.acceptance.passed = True
-            children = [
-                models.Task(task_id=e.id, title=e.title, owner_agent_id=e.id)
-                for e in created
-            ]
+            children = [models.Task(task_id=e.id, title=e.title, owner_agent_id=e.id)
+                        for e in created]
             probe = Orchestrator(max_concurrency=self.max_concurrency)
             probe.decompose(parent, children)
-            for item, egg in zip(plan, created):
-                dep = item[2] if len(item) > 2 else None
-                if dep and dep in by_title:
-                    probe.add_dependency(egg.id, by_title[dep].id)
+            for title, _prompt, deps in plan:
+                for dep in deps:
+                    probe.add_dependency(by_title[title].id, by_title[dep].id,
+                                         condition="success")
             probe.topo_order()
         except Exception as exc:  # noqa: BLE001
-            print(f"[canvas] decomposition invalid: {exc}")
-
+            new_ids = {egg.id for egg in created}
+            for edge_id, edge in list(self.edges.items()):
+                if edge["from"] in new_ids or edge["to"] in new_ids:
+                    self.edges.pop(edge_id, None)
+            for egg in created:
+                await self.delete_egg(egg.id)
+            raise ValueError(f"任务依赖图无法被调度器接受：{exc}") from exc
         self.save()
         return created
 
     async def _plan_with_agent(self, goal):
-        """Ask a real SDK Agent for a JSON task plan (link.md 一.1)."""
-        from google.antigravity import Agent
-
+        """Ask a real SDK Agent for a validated JSON task plan."""
+        from google.antigravity import Agent, types
         config = build_agent_config(
-            "You are the commander of a multi-agent project. Decompose the goal "
-            "into 2-5 concrete tasks. Prefer mostly independent tasks; set "
-            "depends_on to another task title when one must wait. "
-            "You have NO tools and must NOT do the work yourself: never explain, "
-            "never apologize, never write code. Answer with a single JSON object "
-            'and nothing else, shaped exactly like {"tasks": [{"title": "...", '
-            '"prompt": "...", "depends_on": "<other title or omitted>"}]}.',
-            response_schema=PLAN_SCHEMA,
-            tools=(),
-        )
+            """You are the commander of a multi-agent project. Plan the work; do not execute it.
+Rules:
+1. Decompose the goal into 2–5 concrete tasks, each with a unique, non-empty title, clear prompt, and expected deliverable.
+2. Prefer parallel execution for independent tasks.
+3. `depends_on` lists all prerequisites that must successfully complete before the task starts; use [] if none.
+4. Dependencies use exact task titles and contain no cycles.
+5. Review/summary tasks depend on every task whose output they need.
+6. Never assume planned outputs already exist.
+7. Return exactly one JSON object matching the schema, with no Markdown or extra text.""",
+            response_schema=PLAN_SCHEMA, tools=(),
+            capabilities=types.CapabilitiesConfig(
+                enabled_tools=types.BuiltinTools.none(), enable_subagents=False,
+                agent_behavior=types.AgentBehavior.MINIMAL))
         async with Agent(config) as agent:
             response = await agent.chat(f"Goal: {goal}")
-            text = await response.text()
-        data = _extract_json(text)
-        plan = []
-        for item in (data.get("tasks") or [])[:5]:
-            title = str(item.get("title") or "").strip()
-            prompt = str(item.get("prompt") or "").strip()
-            dep = item.get("depends_on")
-            if title and prompt:
-                plan.append((title, prompt, str(dep).strip() if dep else None))
-        return plan
+            data = await response.text()
+            data = await response.structured_output()
+            if not isinstance(data, dict):
+                data = _extract_json(await response.text())
+        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
+            raise ValueError("planner response must contain a tasks list")
+        return _normalize_plan_items(data["tasks"], min_tasks=2)
 
-    async def add_egg(self, title, prompt, x=200, y=200):
+    async def add_egg(self, title, prompt, x=None, y=None):
+        # Default position: below every existing egg so a manually-added egg
+        # never overlaps a generated/parent egg (egg height ≈ 240px + margin).
+        if x is None:
+            x = 200
+        if y is None:
+            y = max((e.y for e in self.eggs.values()), default=160) + 280
         eid = f"e{uuid.uuid4().hex[:8]}"
         egg = EggAgent(
             eid, title, prompt, "egg", (x, y),
@@ -346,12 +575,34 @@ class Canvas:
         srcs = [self.eggs[i] for i in ids if i in self.eggs]
         if not srcs:
             return None
-        combined = "\n\n".join(s.history_text() for s in srcs)
+        # Name combines ALL source egg titles (not just the first), so the new
+        # egg is recognisable as the union of its parts.
+        title = "组合：" + " + ".join(s.title for s in srcs)
+        # Build a per-egg section: name + original task prompt + produced files
+        # + conversation, so the model knows the provenance of each part and
+        # what each egg was asked to do (the old prompt only carried the bare
+        # assistant answers, which was incomplete context).
+        sections = []
+        for s in srcs:
+            files = s.list_files()
+            body = s.history_text()
+            file_line = "\n".join(f"  - {f}" for f in files) if files else "  （无）"
+            sections.append(
+                f"### 子蛋：{s.title}\n"
+                f"原始任务：{s.prompt}\n"
+                f"产出文件：\n{file_line}\n"
+                f"对话内容：\n{body if body else '（该蛋暂无对话产出）'}"
+            )
+        combined = "\n\n".join(sections)
         prompt = (
-            "以下是由多个子蛋产出的内容，请综合整理为一份统一的规格/实现说明：\n\n"
+            "以下是由多个子蛋产出的内容，请综合整理为一份统一的规格/实现说明，"
+            "保留各子蛋的关键结论并消除重复：\n\n"
             + combined
         )
-        new = await self.add_egg(f"组合：{srcs[0].title}", prompt, x=200, y=420)
+        # Position the combined egg BELOW every existing egg (plus a margin)
+        # so it never overlaps a generated/parent egg.
+        max_y = max((e.y for e in self.eggs.values()), default=160)
+        new = await self.add_egg(title, prompt, x=200, y=max_y + 280)
         self.save()
         return new
 
@@ -603,28 +854,52 @@ class Canvas:
                 # An edge is drawn left-to-right (source -> target), so the
                 # TARGET is downstream and depends on the SOURCE: from runs
                 # first, to starts once from is finished.
-                orch.add_dependency(v["to"], v["from"], condition="finished")
+                orch.add_dependency(v["to"], v["from"], condition="success")
         return orch, task_of
 
     # ---- ordering via the demo Orchestrator (link.md 二.7) ----
     def _ordered_targets(self, targets):
-        ids = [t for t in targets if t in self.eggs]
-        if not ids:
+        """Resolve unique target IDs; dependency expansion/order happens in _run_graph."""
+        ids, seen = [], set()
+        for target in targets or []:
+            if target in self.eggs and target not in seen:
+                seen.add(target)
+                ids.append(target)
+        return [self.eggs[eid] for eid in ids]
+
+    def _topological_ids(self, ids):
+        ids = list(dict.fromkeys(i for i in ids if i in self.eggs))
+        node_set = set(ids)
+        edges = [(edge.get("from"), edge.get("to")) for edge in self.edges.values()
+                 if edge.get("from") in node_set and edge.get("to") in node_set]
+        return _assert_acyclic(ids, edges)
+
+    def _execution_ids(self, requested_ids):
+        """Include every upstream prerequisite and return a stable DAG order."""
+        requested = [i for i in dict.fromkeys(requested_ids) if i in self.eggs]
+        if not requested:
             return []
-        if not FRAMEWORK_OK:
-            return [self.eggs[i] for i in ids]
-        orch, _ = self._build_orchestrator(ids)
-        try:
-            order = orch.topo_order()
-        except Exception:
-            order = ids
-        seen = set()
-        out = []
-        for i in order + ids:
-            if i in self.eggs and i not in seen:
-                seen.add(i)
-                out.append(self.eggs[i])
-        return out
+        parents = {}
+        dangling_parents = {}
+        for edge in self.edges.values():
+            source, target = edge.get("from"), edge.get("to")
+            if target not in self.eggs:
+                continue
+            if source not in self.eggs:
+                dangling_parents.setdefault(target, []).append(source)
+            else:
+                parents.setdefault(target, []).append(source)
+        scope, stack = set(requested), list(requested)
+        while stack:
+            current = stack.pop()
+            if dangling_parents.get(current):
+                missing = ", ".join(str(v) for v in dangling_parents[current])
+                raise ValueError(f"task {self.eggs[current].title!r} depends on missing egg(s): {missing}")
+            for parent in parents.get(current, []):
+                if parent not in scope:
+                    scope.add(parent)
+                    stack.append(parent)
+        return self._topological_ids([i for i in self.eggs if i in scope])
 
     # ---- run one egg + integrate the demo framework ----
     async def _run_egg(self, egg, instruction, ctx):
@@ -652,25 +927,52 @@ class Canvas:
 
     # ---- concurrent graph execution ----
     async def _run_graph(self, eggs, instruction_fn, ctx_fn):
-        """Execute eggs as a real DAG with bounded concurrency.
+        """Run targets and their prerequisites; gate downstream tasks on TaskCompleted."""
+        requested_ids = {egg.id for egg in eggs if egg.id in self.eggs}
+        try:
+            ordered_ids = self._execution_ids(requested_ids)
+        except ValueError as exc:
+            yield {"k": "say", "egg": "commander",
+                   "text": f"⛔ 依赖图存在循环，已停止执行：{exc}"}
+            return
+        if not ordered_ids:
+            yield {"k": "say", "egg": "commander", "text": "⚠ 没有可执行的任务。"}
+            return
+        eggs = [self.eggs[eid] for eid in ordered_ids]
 
-        A queue decouples the orchestrator's concurrent dispatches from this
-        single async generator, so the websocket panel receives interleaved
-        events from all running eggs.
-        """
+        def instruction_for(egg):
+            # Only selected targets receive the user's custom instruction.
+            return instruction_fn(egg) if egg.id in requested_ids else egg.prompt
+
         if not FRAMEWORK_OK:
+            completed = set()
+            parents = {}
+            for edge in self.edges.values():
+                if edge.get("from") in self.eggs and edge.get("to") in self.eggs:
+                    parents.setdefault(edge["to"], []).append(edge["from"])
             for egg in eggs:
-                async for ev in self._run_egg(egg, instruction_fn(egg), ctx_fn(egg)):
+                unmet = []
+                for parent_id in parents.get(egg.id, []):
+                    parent = self.eggs[parent_id]
+                    report = getattr(parent, "last_completion_report", None)
+                    if parent_id not in completed or report is None or not getattr(report, "complete", False):
+                        unmet.append(parent.title)
+                if unmet:
+                    yield {"k": "say", "egg": "commander",
+                           "text": f"⛔ 跳过「{egg.title}」：前置任务未完成：{', '.join(unmet)}"}
+                    continue
+                async for ev in self._run_egg(egg, instruction_for(egg), ctx_fn(egg)):
                     yield ev
+                report = getattr(egg, "last_completion_report", None)
+                if report is not None and getattr(report, "complete", False):
+                    completed.add(egg.id)
             return
 
         q: asyncio.Queue = asyncio.Queue()
-        ids = [e.id for e in eggs]
-        orch, task_of = self._build_orchestrator(ids, reset=True)
+        orch, task_of = self._build_orchestrator(ordered_ids, reset=True)
 
         def _event(name, task, **kw):
-            if name in ("started", "retry", "failed", "finished",
-                        "timeout", "canceled"):
+            if name in ("started", "retry", "failed", "finished", "timeout", "canceled"):
                 try:
                     self._store.save(task)
                 except Exception:  # pragma: no cover
@@ -679,23 +981,44 @@ class Canvas:
                           "text": f"[{name}] {task.task_id}",
                           "event": name, "taskId": task.task_id, **kw})
 
-        orch._on_event = _event
+        orch.set_on_event(_event)
 
         async def dispatch(task):
             egg = self.eggs.get(task.task_id)
             if egg is None:
-                return
-            agent = models.AgentInfo(
-                agent_id=egg.id, name=egg.title, permissions=[egg.id],
-                status=models.AgentRunStatus.ONLINE)
+                raise RuntimeError(f"task has no matching egg: {task.task_id}")
+
+            # Do not trust scheduler completion alone: every direct dependency
+            # must satisfy the same artifact/acceptance/report completion rule.
+            for edge in self.edges.values():
+                if edge.get("to") != task.task_id:
+                    continue
+                parent_task = task_of.get(edge.get("from"))
+                if parent_task is None:
+                    continue
+                verdict = completion.evaluate_task_completed(parent_task)
+                if not verdict.complete:
+                    missing = verdict.missing()
+                    reason = ("前置任务未满足完成条件：" + ", ".join(missing)
+                              if missing else "前置任务未通过完成验收")
+                    task.status = models.TaskStatus.BLOCKED
+                    task.metadata["blocked_reason"] = f"{parent_task.title}: {reason}"
+                    self._store.save(task)
+                    await q.put({"k": "say", "egg": "commander",
+                                 "text": f"⛔ 阻止执行「{egg.title}」：前置任务「{parent_task.title}」未完成验收。"})
+                    raise RuntimeError(task.metadata["blocked_reason"])
+
+            agent = models.AgentInfo(agent_id=egg.id, name=egg.title,
+                                     permissions=[egg.id],
+                                     status=models.AgentRunStatus.ONLINE)
             if not infrastructure.can_agent_modify_task(agent, task, "write"):
                 task.metadata["blocked_reason"] = "permission denied"
                 task.status = models.TaskStatus.BLOCKED
+                self._store.save(task)
                 await q.put({"k": "say", "egg": "commander",
                              "text": f"⛔ 无权执行「{egg.title}」"})
-                return
-            # link.md 一.4: TASK_ASSIGN is a real message; the egg's REPORT is
-            # correlated with it so the commander can match reply to assignment.
+                raise RuntimeError("permission denied")
+
             assign = messaging.AgentMessage(
                 msg_type=messaging.MessageType.TASK_ASSIGN,
                 task_id=task.task_id, agent_id=egg.id, sender="commander",
@@ -705,39 +1028,37 @@ class Canvas:
                          "attempt": int(task.metadata.get("attempt", 1))})
             self._bus.publish(assign)
             egg.current_assign_id = assign.msg_id
-            base_runs = list(task.runs)
             shared = self._share_upstream(egg)
             ctx = ctx_fn(egg) or ""
             note = self._shared_note(shared)
             if note:
                 ctx = f"{ctx}\n\n{note}".strip()
                 await q.put({"k": "say", "egg": "commander",
-                             "text": f"📦 {egg.title} 收到上游交付物 "
-                                     f"{len(shared)} 个（shared/）"})
+                             "text": f"📦 {egg.title} 收到上游交付物 {len(shared)} 个（shared/）"})
             try:
-                async for ev in self._run_egg(egg, instruction_fn(egg), ctx):
+                async for ev in self._run_egg(egg, instruction_for(egg), ctx):
                     await q.put(ev)
             finally:
                 egg.current_assign_id = None
+
             src = getattr(egg, "last_task", None)
             if src is not None:
                 task.status = src.status
                 task.artifacts = list(src.artifacts)
                 task.acceptance = src.acceptance
                 task.report_submitted = src.report_submitted
-                # Keep previous attempts; drop only this attempt's RUNNING
-                # placeholder (the egg records the authoritative run).
-                task.runs = [
-                    r for r in base_runs
-                    if r.status != models.ExecutionStatus.RUNNING
-                ] + list(src.runs)
+                task.runs = list(src.runs)
                 task.metadata.update(src.metadata)
+            verdict = completion.evaluate_task_completed(task)
+            if not verdict.complete:
+                missing = verdict.missing()
+                reason = "TaskCompleted 未满足" + (": " + ", ".join(missing) if missing else "")
+                task.metadata["blocked_reason"] = reason
+                if task.status == models.TaskStatus.SUCCESS:
+                    task.status = models.TaskStatus.BLOCKED
+                self._store.save(task)
+                raise RuntimeError(reason)
             self._store.save(task)
-            if task.status == models.TaskStatus.FAILED:
-                # Let the orchestrator apply its retry/backoff policy to
-                # task-level failures too (not just dispatch exceptions).
-                raise RuntimeError(
-                    task.metadata.get("blocked_reason") or "task failed")
 
         async def runner():
             try:
@@ -765,13 +1086,9 @@ class Canvas:
                 runner_task.cancel()
                 orch.cancel_all("interrupted")
 
-        # --- global convergence (link.md 二.12 / 四.第一层) ---
         report = completion.global_report(orch.all())
         self._metrics.set_gauge("convergence", 1.0 if report.complete else 0.0)
         self._metrics.inc("graph_runs")
-
-        # 总指挥确认 (link.md 一.2 的第四态): a task that satisfies the
-        # completion rule is explicitly acknowledged by the commander.
         confirmed = []
         for task in orch.all():
             if completion.evaluate_task_completed(task).complete:
@@ -781,12 +1098,10 @@ class Canvas:
         if confirmed:
             self._audit.record("commander_confirmed", tasks=confirmed)
             self._metrics.inc("tasks_confirmed", len(confirmed))
-
         expired = self._approvals.expire()
         if expired:
             yield {"k": "say", "egg": "commander",
                    "text": f"⌛ 审批超时：{', '.join(a.approval_id for a in expired)}"}
-
         if report.complete:
             text = (f"✅ 全局收敛：{report.completed}/{report.total} 个任务完成"
                     f"（总指挥已确认 {len(confirmed)}）。")
@@ -798,18 +1113,247 @@ class Canvas:
                            complete=report.complete, reasons=report.reasons)
         self.save()
 
-    # ---- Commander run (chat to 总指挥) ----
-    async def commander_run(self, text, targets):
-        eggs = self._ordered_targets(targets or list(self.eggs.keys()))
-        yield {"k": "say", "egg": "commander",
-               "text": f"🧭 总指挥开始协调 {len(eggs)} 个蛋：{text}"}
-        for egg in eggs:
+    # ---- Commander decision (总指挥 decides what to do with a message) ----
+    async def _commander_decide(self, text):
+        """Choose an action using current persisted task status and deliverables."""
+        from google.antigravity import Agent, types
+        egg_lines = []
+        for egg in self.eggs.values():
+            state, artifacts, report_submitted, blocked_reason, complete = "not run", [], False, "", False
+            if FRAMEWORK_OK:
+                try:
+                    task = self._store.load(egg.id)
+                    if task is not None:
+                        state = getattr(task.status, "value", str(task.status))
+                        artifacts = [a.path for a in (task.artifacts or [])]
+                        report_submitted = bool(task.report_submitted)
+                        blocked_reason = str(task.metadata.get("blocked_reason") or "")
+                        complete = completion.evaluate_task_completed(task).complete
+                except Exception as exc:  # noqa: BLE001
+                    state = f"state unavailable: {exc}"
+            egg_lines.append(
+                f"- id={egg.id}; title={egg.title}; status={state}; TaskCompleted={complete}; "
+                f"report_submitted={report_submitted}; artifacts={artifacts[:6]}; "
+                f"blocked_reason={blocked_reason[:180]}; prompt={egg.prompt[:160]!r}")
+        egg_ctx = "\n".join(egg_lines) if egg_lines else "(画布上还没有任何蛋)"
+        config = build_agent_config(
+            f"""You are the 总指挥 (commander) of an IdeaCanvas multi-agent project.
+
+Your ONLY job is to analyze the operator's message and decide on ONE action by outputting a single JSON object. You do NOT execute anything yourself. You do NOT use any tools. The system will execute your decision after you respond.
+
+Current tasks on the canvas:
+{egg_ctx}
+
+Your available actions (pick exactly ONE, output it in the "action" field):
+- answer: The operator's message is a question, clarification, or request for information about the plan/status. Answer it directly in the "reply" field. Do NOT run any tasks.
+- replan: The operator's message reveals missing work, a gap, or asks to simplify/replace the plan. DESCRIBE the new tasks in the "plan.tasks" field (each with title, prompt, depends_on). Do NOT try to create tasks yourself — just describe them in JSON. The system will create them based on your description. If the operator asks to simplify or replace the plan, also list the old egg titles or IDs to remove in the "remove" field.
+- forward: The operator's message is relevant to specific existing eggs. Specify the target egg titles in "targets" and a tailored instruction for each in "instructions".
+- run: The operator explicitly asks to execute/run/start the plan. Run the existing eggs with the message as instruction.
+
+CRITICAL rules:
+- You are a DECISION-MAKER ONLY. You do NOT use tools, create tasks, or execute anything. Your response is just a JSON object describing what should happen.
+- For "replan", simply DESCRIBE new tasks in JSON. Do NOT attempt to call any tool or create anything yourself.
+- Questions like "需要产物吗" or "进度如何" are answer actions, not run actions.
+- Never infer completion from a status string alone; use TaskCompleted and artifacts/report fields.
+- Include brief reasoning and a concise reply in the JSON.
+- Output EXACTLY ONE JSON object matching the schema. No Markdown, no code fences, no explanations outside the JSON.""",
+            response_schema=COMMANDER_DECISION_SCHEMA, tools=(),
+            policies=[],
+            capabilities=types.CapabilitiesConfig(
+                enabled_tools=types.BuiltinTools.none(),
+                enable_sandbox=False,
+                enable_subagents=False,
+                agent_behavior=types.AgentBehavior.MINIMAL))
+        async with Agent(config) as agent:
+            response = await agent.chat(text)
+            # data = await response.text()
+            data = await response.structured_output()
+            if not isinstance(data, dict):
+                data = _extract_json(await response.text())
+        if not isinstance(data, dict):
+            raise ValueError("commander decision must be a JSON object")
+        action = data.get("action")
+        if action not in {"answer", "replan", "forward", "run"}:
+            raise ValueError(f"unsupported commander action: {action!r}")
+        data["reasoning"] = str(data.get("reasoning") or "").strip()
+        data["reply"] = str(data.get("reply") or "").strip()
+        if action == "replan":
+            plan_data = data.get("plan") or {}
+            if not isinstance(plan_data, dict) or not isinstance(plan_data.get("tasks", []), list):
+                raise ValueError("replan action needs plan.tasks list")
+            data["plan"] = plan_data
+        if action == "forward":
+            if not isinstance(data.get("targets", []), list):
+                raise ValueError("forward targets must be a list")
+            if not isinstance(data.get("instructions", {}), dict):
+                raise ValueError("forward instructions must be an object")
+            data["targets"] = [str(value).strip() for value in data.get("targets", [])
+                               if str(value).strip()]
+            data["instructions"] = {
+                str(key).strip(): str(value) for key, value in data.get("instructions", {}).items()
+                if str(key).strip()
+            }
+        return data
+
+    async def _commander_execute_replan(self, decision, text):
+        """Validate a proposed DAG completely before creating any new eggs."""
+        plan_data = decision.get("plan") or {}
+        raw_tasks = plan_data.get("tasks") or []
+        if not raw_tasks:
+            yield {"k": "say", "egg": "commander", "text": "⚠ 重新规划未产生新任务。"}
+            return
+        # Eggs the operator asked to remove are no longer "existing" for
+        # collision/dependency validation — a new task can reuse their title.
+        remove_set = set()
+        for target in (decision.get("remove") or []):
+            for egg in self.eggs.values():
+                if egg.title == target or egg.id == target:
+                    remove_set.add(egg.id)
+
+        existing_title_lists = {}
+        for egg in self.eggs.values():
+            if egg.id in remove_set:
+                continue
+            existing_title_lists.setdefault(egg.title, []).append(egg)
+        duplicates = {title for title, values in existing_title_lists.items() if len(values) > 1}
+        try:
+            normalized = _normalize_plan_items(
+                raw_tasks, available_titles=set(existing_title_lists), max_tasks=5)
+            collisions = [title for title, _prompt, _deps in normalized
+                          if title in existing_title_lists]
+            if collisions:
+                raise ValueError("新任务标题与现有蛋重复：" + ", ".join(collisions))
+            all_deps = {dep for _title, _prompt, deps in normalized for dep in deps}
+            ambiguous = sorted(all_deps & duplicates)
+            if ambiguous:
+                raise ValueError("依赖标题对应多个现有蛋，无法唯一解析：" + ", ".join(ambiguous))
+
+            existing_by_title = {title: values[0] for title, values in existing_title_lists.items()}
+            placeholder = {title: f"new:{title}" for title, _prompt, _deps in normalized}
+            nodes = list(self.eggs) + list(placeholder.values())
+            edges = [(edge.get("from"), edge.get("to")) for edge in self.edges.values()]
+            for title, _prompt, deps in normalized:
+                for dep in deps:
+                    source_id = placeholder[dep] if dep in placeholder else existing_by_title[dep].id
+                    edges.append((source_id, placeholder[title]))
+            _assert_acyclic(nodes, edges)
+        except Exception as exc:  # noqa: BLE001
             yield {"k": "say", "egg": "commander",
-                   "text": f"→ 派发任务给「{egg.title}」"}
+                   "text": f"⛔ 重新规划校验失败，未修改画布：{exc}"}
+            return
+
+        # --- Step 1: remove old eggs if the operator asked to simplify/replace ---
+        removed = []
+        for target in (decision.get("remove") or []):
+            matches = [egg for egg in self.eggs.values()
+                       if egg.title == target or egg.id == target]
+            if len(matches) == 1:
+                await self.delete_egg(matches[0].id)
+                removed.append(matches[0].title)
+            elif len(matches) > 1:
+                yield {"k": "say", "egg": "commander",
+                       "text": f"⚠ 无法移除「{target}」：存在多个同名蛋。"}
+
+        # --- Step 2: create new eggs ---
+        created_by_title = {}
+        for index, (title, prompt, _deps) in enumerate(normalized):
+            row, col = divmod(len(self.eggs) + index, 3)
+            created_by_title[title] = await self.add_egg(
+                title, prompt, x=120 + col * 380, y=160 + row * 240)
+
+        # --- Step 3: wire up dependencies ---
+        title_to_egg = {title: values[0] for title, values in existing_title_lists.items()}
+        title_to_egg.update(created_by_title)
+        for title, _prompt, deps in normalized:
+            for dep in deps:
+                if dep in title_to_egg and title in created_by_title:
+                    await self.add_edge(
+                        title_to_egg[dep].id, created_by_title[title].id)
+
+        self.save()
+
+        # --- Step 4: notify frontend to re-sync the egg list ---
+        yield {"k": "sync_graph"}
+
+        msg = f"✅ 已创建 {len(created_by_title)} 个新蛋"
+        if removed:
+            msg += f"，移除 {len(removed)} 个旧蛋（{', '.join(removed)}）"
+        msg += "；依赖已校验，开始执行新任务。"
+        yield {"k": "say", "egg": "commander", "text": msg}
+
+        async for ev in self._run_graph(
+                list(created_by_title.values()), lambda egg: text,
+                lambda egg: self.neighbor_context(egg.id)):
+            yield ev
+
+    async def commander_run(self, text, targets):
+        """Route commander chat safely; never execute every egg on decision failure."""
+        decision, failure = None, None
+        if SDK_OK:
+            try:
+                timeout = _env_float("CANVAS_COMMANDER_DECIDE_TIMEOUT", 60.0)
+                decision = await asyncio.wait_for(self._commander_decide(text), timeout=timeout)
+            except Exception as exc:  # noqa: BLE001
+                failure = exc
+        else:
+            failure = RuntimeError("SDK 不可用")
+        if decision is None:
+            reason = str(failure) if failure else "无法得到有效决策"
+            yield {"k": "say", "egg": "commander",
+                   "text": f"⚠ 总指挥决策失败：{reason}。为避免误执行，未自动派发给所有蛋。请明确指示“运行计划”或使用画布的选中任务运行功能。"}
+            yield {"k": "end"}
+            return
+
+        action = decision["action"]
+        yield {"k": "say", "egg": "commander",
+               "text": f"🧠 总指挥分析：{decision.get('reasoning', '')}"}
+        reply = decision.get("reply", "")
+        if reply:
+            yield {"k": "say", "egg": "commander", "text": reply}
+        if action == "answer":
+            yield {"k": "say", "egg": "commander", "text": "🏁 总指挥已回答，未运行任务。"}
+            yield {"k": "end"}
+            return
+        if action == "replan":
+            async for ev in self._commander_execute_replan(decision, text):
+                yield ev
+            yield {"k": "say", "egg": "commander", "text": "🏁 总指挥重新规划流程结束。"}
+            yield {"k": "end"}
+            return
+        if action == "forward":
+            target_titles = decision.get("targets") or []
+            instructions = decision.get("instructions") or {}
+            target_eggs = []
+            for target in target_titles:
+                matches = [egg for egg in self.eggs.values()
+                           if egg.title == target or egg.id == target]
+                if len(matches) == 1 and matches[0] not in target_eggs:
+                    target_eggs.append(matches[0])
+            if not target_eggs:
+                yield {"k": "say", "egg": "commander",
+                       "text": "⚠ 未能匹配明确的目标蛋，未派发给所有蛋。请指定蛋标题或 ID。"}
+                yield {"k": "end"}
+                return
+            yield {"k": "say", "egg": "commander",
+                   "text": f"→ 向 {len(target_eggs)} 个相关蛋传递信息；前置任务将先行执行并验收。"}
+            async for ev in self._run_graph(
+                    target_eggs, lambda egg: instructions.get(egg.title, text),
+                    lambda egg: self.neighbor_context(egg.id)):
+                yield ev
+            yield {"k": "say", "egg": "commander", "text": "🏁 信息传递流程结束。"}
+            yield {"k": "end"}
+            return
+
+        eggs = self._ordered_targets(targets or list(self.eggs.keys()))
+        if not eggs:
+            yield {"k": "say", "egg": "commander", "text": "⚠ 画布上没有可运行的蛋。"}
+            yield {"k": "end"}
+            return
+        yield {"k": "say", "egg": "commander", "text": f"🚀 执行：{text}"}
         async for ev in self._run_graph(
                 eggs, lambda egg: text, lambda egg: self.neighbor_context(egg.id)):
             yield ev
-        yield {"k": "say", "egg": "commander", "text": "🏁 总指挥协调完成。"}
+        yield {"k": "say", "egg": "commander", "text": "🏁 运行流程结束。"}
         yield {"k": "end"}
 
     # ---- one-click run of selected eggs ----
@@ -820,7 +1364,7 @@ class Canvas:
             yield {"k": "end"}
             return
         yield {"k": "say", "egg": "commander",
-               "text": f"🚀 按依赖顺序运行 {len(eggs)} 个蛋（并发上限 {self.max_concurrency}）"}
+               "text": f"🚀 运行所选任务及其前置任务（所选 {len(eggs)} 个，并发上限 {self.max_concurrency}）"}
         async for ev in self._run_graph(
                 eggs, lambda egg: egg.prompt,
                 lambda egg: self.neighbor_context(egg.id)):
@@ -946,9 +1490,18 @@ class Canvas:
     def save(self):
         if self.session_dir is None:
             return
+
+        def _cap(v, n=20000):
+            # Tool results carry whole file bodies; keep canvas.json loadable.
+            if isinstance(v, str) and len(v) > n:
+                return v[:n] + f"…[truncated {len(v) - n} chars]"
+            return v
+
         data = {
             "session_id": self.session_id,
-            "eggs": [e.spec() for e in self.eggs.values()],
+            "eggs": [{**e.spec(), "transcript": [
+                {k: _cap(v) for k, v in entry.items()} for entry in e.transcript
+            ]} for e in self.eggs.values()],
             "edges": list(self.edges.values()),
             "commander_transcript": self.commander.transcript,
             "context": self._context.to_dict() if self._context else {},
@@ -986,6 +1539,12 @@ class Canvas:
                 metrics=self._metrics, audit=self._audit, context=self._context,
             )
             self.eggs[spec["id"]] = egg
+            restored = spec.get("transcript") or []
+            if restored:
+                egg.transcript = restored
+                # Transcript already came from disk; skip the SDK history replay
+                # in _hydrate_transcript_from_sdk or every step shows up twice.
+                egg._hydrated = True
         for e in data.get("edges", []):
             self.edges[e["id"]] = e
         self.commander.transcript = data.get("commander_transcript", [])

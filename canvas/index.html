@@ -252,7 +252,7 @@
 
   <div id="traceModal">
     <div class="box">
-      <div class="m-head"><span id="traceTitle">全局对话轨迹</span><span class="rf" id="traceConn"></span><button class="x" id="traceX">✕</button></div>
+      <div class="m-head"><span id="traceTitle">全局对话轨迹</span><span class="rf" id="traceConn"></span><label class="rf" style="display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none;" title="追加显示 system 记录（系统提示词/工具/状态）、💭思考与工具结果"><input type="checkbox" id="traceAll">显示全部</label><button class="x" id="traceX">✕</button></div>
       <div class="tabs" id="traceTabs"></div>
       <div class="m-body" id="traceBody"></div>
     </div>
@@ -516,6 +516,13 @@ function clearHistory(eggId){
     cmdActFinish();
     delete activeStream['commander'];
     setCmdStatus('idle');
+    // Clear the trace cache so the 轨迹 modal doesn't show stale records
+    // from the previous session.
+    if(traceKey === 'commander'){
+      _traceCache = null;
+      _traceCacheKey = null;
+      fetchTrace('commander');
+    }
     return;
   }
   const e = state.eggs[eggId];
@@ -945,7 +952,7 @@ $('#reasonChk').addEventListener('change', ev=>{
 });
 
 /* ---------- trace (conversation records, time-ordered) ---------- */
-let traceKey = null, traceTimer = null, _traceLast = 0;
+let traceKey = null, traceTimer = null, _traceLast = 0, traceShowAll = false, _traceCache = null, _traceCacheKey = null;
 function traceURL(key){ return key==='commander' ? '/api/trace/commander' : `/api/trace/${key}`; }
 function refreshTraceThrottled(){
   const now=Date.now();
@@ -955,9 +962,14 @@ async function fetchTrace(key){
   if(!key) return;
   try{
     const r=await fetch(traceURL(key));
-    if(r.ok) renderTrace(await r.json(), key);
+    if(r.ok){ const d=await r.json(); _traceCache=d; _traceCacheKey=key; renderTrace(d, key); }
   }catch(e){}
 }
+// 「显示全部」开关：用缓存的数据即时重渲染，不必再等一次 fetch。
+$('#traceAll').onchange = e=>{
+  traceShowAll = e.target.checked;
+  if(_traceCache && _traceCacheKey===traceKey) renderTrace(_traceCache, traceKey);
+};
 function renderTrace(data, key){
   const label = key==='commander' ? '总指挥' : (data.title || key);
   $('#traceTitle').textContent = '对话轨迹 · ' + label;
@@ -969,10 +981,10 @@ function renderTrace(data, key){
   const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
   const prevTop = body.scrollTop;
   body.innerHTML='';
-  // 子蛋与总指挥的轨迹面板都只显示 user / assistant 的非思考记录；
-  // 💭思考、🔧工具调用/结果与 system 记录仍由后端完整返回，只是不在此展示。
+  // 默认简洁视图只显示 user / assistant 的非思考记录；勾选「显示全部」后
+  // 追加 system（系统提示词/可用工具/状态/实际发送的 prompt）、💭思考与🔧工具结果。
   const list=(data.transcript||[]).filter(it=>
-    it && (it.role==='user'||it.role==='assistant') && it.kind!=='thought');
+    it && (traceShowAll || ((it.role==='user'||it.role==='assistant') && it.kind!=='thought')));
   if(!list.length){
     body.innerHTML='<div class="trace-item"><div class="empty">暂无对话记录。向该蛋发送命令后，这里会按时间顺序显示用户指令与模型回复。</div></div>';
     return;

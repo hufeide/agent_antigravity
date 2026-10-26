@@ -81,6 +81,11 @@ class Orchestrator:
         self._on_event = on_event
         self._tasks: dict[str, "models.Task"] = {}
         self._running_async: dict[str, asyncio.Future] = {}
+        # Task ids whose sync dispatch thread overran the per-task timeout and
+        # was abandoned (its concurrent.futures.Future cannot be cancelled once
+        # the worker thread is running). Used to guard against processing the
+        # late completion of an abandoned thread.
+        self._timed_out: set[str] = set()
 
     # ------------------------------------------------------------------
     # Registration / decomposition
@@ -305,6 +310,10 @@ class Orchestrator:
         except Exception:  # pragma: no cover - observers must not break scheduling
             logger.debug("on_event failed", exc_info=True)
 
+    def set_on_event(self, on_event: Callable[..., None] | None) -> None:
+        """Set/replace the event observer (public API; see _emit)."""
+        self._on_event = on_event
+
     def _begin(self, task: "models.Task") -> None:
         task.metadata.setdefault("attempt", 1)
         task.metadata.pop("retry_after", None)
@@ -427,6 +436,7 @@ class Orchestrator:
                 logger.warning("No dispatch wired; task %s not executed", tid)
             return self._tasks
 
+        self._timed_out = set()
         started: dict[str, float] = {}
         futures: dict[concurrent.futures.Future, "models.Task"] = {}
         with concurrent.futures.ThreadPoolExecutor(
@@ -454,6 +464,11 @@ class Orchestrator:
                 )
                 for fut in done:
                     task = futures.pop(fut)
+                    if task.task_id in self._timed_out:
+                        # The dispatch thread finished after we abandoned it on
+                        # timeout; its result is stale and must not resurrect
+                        # the task (e.g. via _finish setting it to SUCCESS).
+                        continue
                     started.pop(task.task_id, None)
                     try:
                         fut.result()
@@ -473,6 +488,7 @@ class Orchestrator:
                                 futures.pop(fut, None)
                                 break
                         started.pop(tid, None)
+                        self._timed_out.add(tid)
                         self._timeout(self._tasks[tid], timeout)
 
         self._check_stuck()

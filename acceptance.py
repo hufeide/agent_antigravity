@@ -115,7 +115,13 @@ def validate_artifact(
         artifact.status = models.ArtifactStatus.REJECTED
         artifact.metadata["reason"] = f"empty: {p}"
         return False
-    artifact.status = models.ArtifactStatus.GENERATED
+    # Only advance to GENERATED; never downgrade an already-ACCEPTED artifact
+    # back to GENERATED on re-validation. completion.evaluate_task_completed
+    # re-validates artifacts AFTER evaluate_acceptance -> mark_artifacts has
+    # already moved them to ACCEPTED; unconditionally setting GENERATED here
+    # would erase the acceptance verdict.
+    if artifact.status != models.ArtifactStatus.ACCEPTED:
+        artifact.status = models.ArtifactStatus.GENERATED
     artifact.metadata.pop("reason", None)
     return True
 

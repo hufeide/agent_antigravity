@@ -112,12 +112,38 @@ def is_corrupt_conversation_error(err):
     if err is None:
         return False
     text = str(err)
-    return (
-        "must contain either" in text      # empty assistant message (HTTP 400)
-        or "invalid_request" in text
-        or "cannot resume" in text
-        or "not found" in text.lower()
-    )
+    low = text.lower()
+    # Empty assistant message -> HTTP 400 (the model server rejects the whole
+    # history once a turn persisted neither content nor tool_calls).
+    if "must contain either" in text:
+        return True
+    if "invalid_request" in low:
+        return True
+    # A missing/stale persisted conversation: the SDK refuses to resume. Match
+    # the combination rather than bare "not found" (which also fires for
+    # missing files, missing models, etc. and would misclassify unrelated
+    # errors as a corrupt conversation).
+    if "cannot resume" in low:
+        return True
+    if "conversation" in low and "not found" in low:
+        return True
+    return False
+
+
+def is_stream_stall_error(err):
+    """True when the client-side stream watchdog aborted the model turn.
+
+    The harness aborts a turn after ~120s of stream silence ("model stream
+    stalled" / "模型流静默超过120s"). This is distinct from "the server is
+    down": llama.cpp streams nothing during prefill, and cannot detect the
+    client disconnect mid-prefill, so the aborted request may keep burning a
+    slot. Callers should probe the server and wait for slot release instead
+    of blindly retrying or rebuilding the harness.
+    """
+    if err is None:
+        return False
+    low = str(err).lower()
+    return "stalled" in low or "静默" in low or "stream timeout" in low
 
 
 def compaction_config():

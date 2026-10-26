@@ -178,8 +178,9 @@ class MessageBus:
             if fut is None:
                 return True
             try:
-                await asyncio.wait_for(fut, timeout=timeout)
-                return True
+                # Return the actual ack outcome: True when acked, False when
+                # the wait was resolved by clear() or expired.
+                return bool(await asyncio.wait_for(fut, timeout=timeout))
             except asyncio.TimeoutError:
                 self.expire_acks()
                 return False
@@ -221,19 +222,47 @@ class MessageBus:
         waiters = self._ack_waiters.pop(msg_id, [])
         for fut in waiters:
             if not fut.done():
-                fut.set_result(True)
+                # Wake on the waiter's own loop: ack()/publish() may run on
+                # a different thread/loop than the one blocked in apublish().
+                loop = fut.get_loop()
+                try:
+                    loop.call_soon_threadsafe(fut.set_result, True)
+                except RuntimeError:
+                    # Loop already closed: apublish's timeout/finally cleans up.
+                    pass
 
     # -- correlation --------------------------------------------------------
     def _resolve_waiters(self, msg: AgentMessage) -> None:
-        self._resolve_ack(msg.msg_id)
+        # NOTE: ack waiters are NOT resolved here. They are registered by
+        # apublish() under the SAME msg_id it just published, so resolving
+        # them on publish would wake the publisher instantly and make
+        # require_ack a no-op. Ack resolution happens only via ack().
         if not msg.correlation_id:
             return
+        remaining: list[tuple[str | None, asyncio.Future]] = []
         for msg_type, fut in list(self._msg_waiters.get(msg.correlation_id, [])):
             if fut.done():
                 continue
             if msg_type is None or msg_type == msg.msg_type.value:
-                fut.set_result(msg)
-        self._msg_waiters.pop(msg.correlation_id, None)
+                # Wake the waiter on its OWN event loop: publish() may run on
+                # a different thread/loop than the one blocked in wait_for,
+                # and set_result() from the wrong loop is unsafe.
+                loop = fut.get_loop()
+                try:
+                    loop.call_soon_threadsafe(fut.set_result, msg)
+                except RuntimeError:
+                    # Loop already closed: the waiter's timeout/finally block
+                    # will clean this entry up.
+                    pass
+            else:
+                # NOT matched: keep the waiter registered so a later,
+                # matching message can still wake it (popping it here would
+                # strand the caller until its timeout).
+                remaining.append((msg_type, fut))
+        if remaining:
+            self._msg_waiters[msg.correlation_id] = remaining
+        else:
+            self._msg_waiters.pop(msg.correlation_id, None)
 
     def correlate(self, correlation_id: str) -> list[AgentMessage]:
         with self._lock:
@@ -306,6 +335,14 @@ class MessageBus:
             ]
 
     def clear(self) -> None:
+        """Reset the bus to a pristine state.
+
+        Waiters registered in wait_for()/apublish() are woken (not cancelled)
+        so blocked coroutines return promptly instead of stranding until their
+        timeout against a bus that no longer holds their state: correlated
+        waiters resolve to None (wait_for's "no reply" contract), ack waiters
+        resolve to False (apublish's "not acknowledged" contract).
+        """
         with self._lock:
             self._subscribers.clear()
             self._seen.clear()
@@ -313,3 +350,32 @@ class MessageBus:
             self._expired.clear()
             self._history.clear()
             self._by_correlation.clear()
+            msg_waiters = [
+                (correlation_id, (wanted, fut))
+                for correlation_id, waiters in self._msg_waiters.items()
+                for wanted, fut in waiters
+            ]
+            ack_waiters = [
+                (msg_id, fut)
+                for msg_id, waiters in self._ack_waiters.items()
+                for fut in waiters
+            ]
+            self._msg_waiters.clear()
+            self._ack_waiters.clear()
+
+        # Wake outside the lock: each future resolves on its own loop
+        # (clear() may be called from any thread/loop).
+        for correlation_id, (_wanted, fut) in msg_waiters:
+            if not fut.done():
+                loop = fut.get_loop()
+                try:
+                    loop.call_soon_threadsafe(fut.set_result, None)
+                except RuntimeError:
+                    pass
+        for _msg_id, fut in ack_waiters:
+            if not fut.done():
+                loop = fut.get_loop()
+                try:
+                    loop.call_soon_threadsafe(fut.set_result, False)
+                except RuntimeError:
+                    pass

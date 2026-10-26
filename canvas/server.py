@@ -1,6 +1,7 @@
 """FastAPI server: serves the canvas UI, exposes a WebSocket control channel,
 and REST endpoints for inspecting each egg's worktree (review code)."""
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from fastapi.responses import FileResponse
 
 from .graph import Canvas
 from .egg import reasoning_capture_state
+
+logger = logging.getLogger(__name__)
 
 FRONTEND = Path(__file__).resolve().parent / "index.html"
 
@@ -193,7 +196,7 @@ async def decide_approval(
     return {"approval": approval, "approvals": canvas.approvals()}
 
 
-async def _send_event(ws: WebSocket, ev: dict):
+async def _send_event(ws: WebSocket, canvas, ev: dict):
     """Translate ONE orchestration event into a WS message.
 
     Shared by the commander (advice/control) and the one-click run:
@@ -202,16 +205,22 @@ async def _send_event(ws: WebSocket, ev: dict):
       egg      -> stream an egg's reply tokens
       end_egg  -> finalize that egg's stream
       end      -> finalize the commander stream
+
+    ``canvas`` must be passed in: it is a local of the app factory (L25),
+    NOT a module global — referencing it here without the parameter raises
+    NameError on the first say event.
     """
     k = ev.get("k")
     if k == "say":
         # role="system" = a process note (stage header / error / failure summary):
         # it belongs in the 轨迹, NOT in the chat panel, which shows the
         # commander's own words only.
+        canvas.commander.note_say(ev["text"], ev.get("role", "assistant"))
         await ws.send_json({"type": "token", "eggId": "commander",
                             "text": ev["text"], "role": ev.get("role", "assistant")})
     elif k == "say_break":
         # Start a NEW commander message (the previous one is finalized).
+        canvas.commander.note_break()
         await ws.send_json({"type": "sayBreak", "eggId": "commander"})
     elif k == "instruct":
         await ws.send_json({"type": "msg", "eggId": ev["egg"], "role": "user",
@@ -232,6 +241,10 @@ async def _send_event(ws: WebSocket, ev: dict):
                             "taskId": ev.get("taskId"), "text": ev.get("text")})
     elif k == "completion":
         await ws.send_json({"type": "completion", "report": ev["report"]})
+    elif k == "sync_graph":
+        # The commander created/removed eggs (e.g. replan) — tell the frontend
+        # to re-sync the egg list so new eggs appear on the canvas.
+        await ws.send_json({"type": "eggs", **canvas.view()})
     elif k == "end":
         # The commander panel is idle again -> its button is restored.
         await ws.send_json({"type": "status", "eggId": "commander", "status": "idle"})
@@ -261,7 +274,7 @@ def _run_commander_panel(ws: WebSocket, canvas: Canvas, kind: str,
                                 "status": "running"})
             gen = agen_factory()
             async for ev in gen:
-                await _send_event(ws, ev)
+                await _send_event(ws, canvas, ev)
         except asyncio.CancelledError:
             # Interrupted by the stop button: tell the user, then let the
             # cancellation propagate so the workflow's finally blocks clean up.
@@ -313,6 +326,9 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         await ws.send_json({"type": "eggs", **canvas.view()})
         # A generate opens a BRAND-NEW session: wipe any stale commander history
         # shown in the panel so the user doesn't see the previous idea's chat.
+        # ALSO clear the server-side transcript so /api/trace/commander returns
+        # empty — otherwise the 轨迹 modal keeps showing the previous idea.
+        canvas.commander.transcript.clear()
         await ws.send_json({"type": "clearHistory", "eggId": "commander"})
         for e in created:
             await ws.send_json(
@@ -328,7 +344,7 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         await ws.send_json({"type": "eggs", **canvas.view()})
 
     elif t == "command":
-        eid = msg["eggId"]
+        eid = msg.get("eggId")
         egg = canvas.eggs.get(eid)
         if not egg:
             return
@@ -338,7 +354,7 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
 
         async def produce():
             await ws.send_json({"type": "status", "eggId": eid, "status": "running"})
-            gen = egg.run(msg["text"], context=ctx)
+            gen = egg.run(msg.get("text", ""), context=ctx)
             try:
                 async for tok in gen:
                     await ws.send_json({"type": "token", "eggId": eid, "text": tok})
@@ -422,12 +438,15 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
             canvas._context.clear()
         await ws.send_json({"type": "eggs", **canvas.view()})
         # A new (empty) session starts with a clean commander chat.
+        # ALSO clear the server-side transcript so /api/trace/commander returns
+        # empty — otherwise the 轨迹 modal keeps showing the previous session.
+        canvas.commander.transcript.clear()
         await ws.send_json({"type": "clearHistory", "eggId": "commander"})
         await ws.send_json({"type": "sessions", "sessions": Canvas.list_sessions()})
         await ws.send_json({"type": "session", "sessionId": sid})
 
     elif t == "compress":
-        egg = canvas.eggs.get(msg["eggId"])
+        egg = canvas.eggs.get(msg.get("eggId"))
         if not egg:
             return
 
@@ -467,25 +486,27 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
             )
 
     elif t == "deleteEgg":
-        await canvas.delete_egg(msg["id"])
+        await canvas.delete_egg(msg.get("id"))
         await ws.send_json({"type": "eggs", **canvas.view()})
 
     elif t == "deleteEdge":
-        await canvas.delete_edge(msg["id"])
+        await canvas.delete_edge(msg.get("id"))
         await ws.send_json({"type": "eggs", **canvas.view()})
 
     elif t == "addEdge":
-        await canvas.add_edge(msg["from"], msg["to"])
+        await canvas.add_edge(msg.get("from"), msg.get("to"))
         await ws.send_json({"type": "eggs", **canvas.view()})
 
     elif t == "move":
-        await canvas.move(msg["id"], msg["x"], msg["y"])
+        await canvas.move(msg.get("id"), msg.get("x"), msg.get("y"))
 
     elif t == "commander":
         targets = msg.get("targets") or (
             [msg.get("target")] if msg.get("target") else []
         )
         text = msg.get("text", "")
+        if text:
+            canvas.commander.note_user(text)
         # Run in a dedicated task so the stop button can interrupt the run
         # (and the websocket read-loop stays free) — same as an egg's command.
         _run_commander_panel(
@@ -554,4 +575,4 @@ async def ws_endpoint(websocket: WebSocket):
             except Exception as ex:  # keep the socket alive on per-message errors
                 await websocket.send_json({"type": "error", "message": str(ex)})
     except Exception as ex:  # client disconnected
-        print(f"[ws] closed: {ex}")
+        logger.debug("[ws] closed: %s", ex)

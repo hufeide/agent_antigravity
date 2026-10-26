@@ -12,13 +12,15 @@ import json
 import os
 import re
 import urllib.parse
+import urllib.request
 import time
 import uuid
 import logging
 from pathlib import Path
 
 from .config import (WORKTREE_ROOT, BACKEND, quiet_sdk_start,
-                     backend_options, is_corrupt_conversation_error)
+                     backend_options, is_corrupt_conversation_error,
+                     is_stream_stall_error)
 from .reasoning import (set_reasoning_capture, reasoning_capture_state,
                         thought_text)
 from .. import acceptance, agent_runtime, completion, infrastructure, messaging, models
@@ -36,6 +38,11 @@ logger = logging.getLogger(__name__)
 # Built-in tools that produce/change files. Used to decide whether an egg with
 # no artifacts is legitimately chat-only or actually failed to deliver.
 _WRITE_TOOLS = frozenset({"create_file", "edit_file", "write_file", "delete_file"})
+
+# After a FAILED harness start, wait this long before another attempt is
+# allowed. Prevents hammering a genuinely-down backend on every command while
+# ensuring one transient failure never bricks the egg for the process lifetime.
+_START_RETRY_COOLDOWN = 30.0
 
 # A task that names a file (REPORT.md, impl.py, ...) or asks to write one
 # REQUIRES an artifact: a text-only reply that claims "done" must not pass.
@@ -169,7 +176,13 @@ class EggAgent:
         self._lock = asyncio.Lock()
         self._cm = None
         self._agent = None
-        self._start_attempted = False
+        # Start state machine: stopped -> starting -> ready / failed. A FAILED
+        # start becomes retryable after START_RETRY_COOLDOWN seconds instead of
+        # being cached for the whole process lifetime; the lock serializes
+        # concurrent startups so parallel commands never spawn two harnesses.
+        self._start_state = "stopped"
+        self._start_failed_at = 0.0
+        self._start_lock = asyncio.Lock()
         self._start_error = None
         self._recorded_init = False
         self._si = ""
@@ -231,6 +244,26 @@ class EggAgent:
         self._last_stop_reason = None
         # Whether the SDK's persisted step history has been replayed into the trace
         self._hydrated = False
+        # ---- per-turn / per-run guard attributes ----
+        # Initialised here (not lazily in _chat_once/run) so the SDK tool hooks,
+        # which fire during agent.chat(), can never hit an AttributeError if a
+        # hook is invoked before the first _chat_once sets them.
+        # Cross-surface tool-call dedupe bookkeeping (hook vs chunk stream).
+        self._tc_seen = {"hook": {}, "chunk": {}}
+        self._last_tc_sig = None
+        self._tc_repeat = 0
+        self._loop_guard = False
+        # Set True once this egg has EVER called a file-writing tool in the
+        # current run. Used to tell a genuine chat-only egg from one that tried
+        # to produce files and failed. Reset once per RUN (in run()), not per
+        # retry attempt, so a retry cannot dodge the artifact requirement by
+        # quietly skipping the file tools it failed with on a previous attempt.
+        self._used_file_tools = False
+        # Stall watchdog counter (no model chunk for _STALL_TIMEOUT).
+        self._stalls = 0
+        # The instruction text for the current run (used by _needs_write_nudge
+        # and the artifact-requirement heuristic).
+        self._last_instruction = ""
 
     # ---- serialization for the frontend ----
     def spec(self):
@@ -277,36 +310,19 @@ class EggAgent:
 
     def _config(self, resume=True):
         si = (
-            f"You are an autonomous LLM module living inside an 'idea egg' named "
-            f"'{self.title}'.\nYour module responsibility (prompt): {self.prompt}\n"
-            f"You have a workspace directory: {self.worktree} "
-            f"(file/command tools are available if you need them).\n"
-            f"BEFORE you start, decide what kind of task this is:\n"
-            f"(A) The task genuinely REQUIRES CODE (implementing a program, "
-            f"algorithm, script, service or tool). Then implement it for real: "
-            f"write actual source files into the workspace and RUN them with the "
-            f"command tools to verify they work. Never fake it — only report what "
-            f"you actually ran and observed.\n"
-            f"(B) The task is a GENERAL (non-programming) task — e.g. writing "
-            f"copy/text, analysis, research summary, planning, brainstorming, "
-            f"data organization, answering a question. Then do NOT treat it as a "
-            f"programming task: complete it directly in your reply, and do not "
-            f"invent a program just to look productive. Saving genuinely useful "
-            f"artifacts (notes, documents, data) into the workspace is allowed "
-            f"but optional.\n"
-            f"Either way, the deliverable is your final reply: state clearly what "
-            f"you produced. If you wrote code, list the files and how to run them; "
-            f"if you did not, present the content/result directly. "
-            f"IMPORTANT: if the task names a FILE to produce (e.g. REPORT.md), "
-            f"you MUST actually create it with create_file/edit_file and verify "
-            f"it exists before answering. Claiming you wrote a file without "
-            f"calling the tool is a failed task. "
-            f"Whenever you must hand over a written artifact, write it as a "
-            f"Markdown file in the ROOT of your workspace directory — that root "
-            f"is exactly what the user inspects with 「审阅代码」. Never put a "
-            f"deliverable inside agent_data/ (an internal folder the user "
-            f"cannot see). "
-            f"Coordinates with connected eggs only when instructed. Be concise."
+"""
+You are an autonomous LLM module in the idea egg '{self.title}'.
+
+Task: {self.prompt}
+Workspace: {self.worktree}
+
+Rules:
+1. **Code tasks:** If programming is genuinely required, implement actual source files in the workspace and run them to verify. Report only what you actually did and observed.
+2. **Non-code tasks:** Complete writing, analysis, research, planning, and other general tasks directly. Do not invent code unnecessarily.
+3. **Deliverables:** Your final reply must clearly state the result. For code, list files and run instructions; otherwise, present the result directly. Save any written deliverable as a Markdown file in the workspace root, never in `agent_data/`.
+4. Coordinate with connected eggs only when instructed.
+5. Be concise and truthful.
+"""
         )
         # Only keep the minimal SWE toolset (write/run code) — drop the default
         # web/image/subagent tools that bloat the context and are unused here.
@@ -537,7 +553,7 @@ class EggAgent:
             # the egg is resumed under a fresh session dir — makes the SDK refuse
             # to resume ("... not found ... (cannot resume)"). Recover by starting
             # a FRESH conversation instead of leaving the egg permanently offline.
-            if "cannot resume" in str(ex) or "not found" in str(ex).lower():
+            if is_corrupt_conversation_error(ex):
                 try:
                     self._cm, self._agent = await self._open_agent(resume=False)
                     try:
@@ -545,12 +561,12 @@ class EggAgent:
                                                 or self.conversation_id)
                     except Exception:
                         self.conversation_id = uuid.uuid4().hex
-                    print(f"[egg {self.id}] stale conversation -> started fresh "
-                          f"(id={self.conversation_id})")
+                    logger.info("[egg %s] stale conversation -> started fresh "
+                                "(id=%s)", self.id, self.conversation_id)
                     return
                 except Exception as ex2:
                     ex = ex2
-            print(f"[egg {self.id}] agent start failed: {ex}")
+            logger.warning("[egg %s] agent start failed: %s", self.id, ex)
             self._cm = None
             self._agent = None
             self._start_error = ex
@@ -563,54 +579,70 @@ class EggAgent:
                 pass
         self._cm = None
         self._agent = None
+        self._start_state = "stopped"
+        self._start_failed_at = 0.0
 
     # ---- interactions ----
     async def _ensure_started(self):
-        """Lazily connect to the model on first use; cache failure per process."""
+        """Lazily connect to the model on first use.
+
+        State machine: stopped -> starting -> ready / failed. A FAILED start
+        is retried after ``_START_RETRY_COOLDOWN`` seconds — one transient
+        failure (harness spawn hiccup, model slot busy with an aborted
+        prefill) must never brick the egg for the process lifetime.
+        Concurrent callers share one startup via ``_start_lock`` so parallel
+        commands cannot each spawn their own harness.
+        """
         if self._agent is not None:
             return True
-        if self._start_attempted:
-            return False
-        self._start_attempted = True
-        await self.start()
-        # If the SDK created a brand-new conversation (we did NOT pass a
-        # conversation_id to resume), capture the id it assigned so later turns /
-        # process restarts resume THIS session instead of failing with
-        # "conversation ... not found ... cannot resume".
-        if self.conversation_id is None and self._agent is not None:
-            cid = getattr(self._agent, "conversation_id", None)
-            if cid:
-                self.conversation_id = cid
-        # Recover from a missing persisted conversation: if resume failed because
-        # the conversation_id isn't in save_dir, drop it and reconnect so the SDK
-        # starts a FRESH conversation instead of hard-failing every turn.
-        if self._agent is None and self._start_error is not None and self.conversation_id is not None:
-            err = str(self._start_error)
-            if "conversation" in err and ("not found" in err or "cannot resume" in err
-                                          or "resume" in err):
+        async with self._start_lock:
+            if self._agent is not None:
+                return True
+            if (self._start_state == "failed"
+                    and time.monotonic() - self._start_failed_at
+                    < _START_RETRY_COOLDOWN):
+                return False
+            self._start_state = "starting"
+            self._start_error = None
+            await self.start()
+            # Recover from a missing persisted conversation: if resume failed
+            # because the conversation_id isn't in save_dir, drop it and
+            # reconnect so the SDK starts a FRESH conversation instead of
+            # hard-failing every turn.
+            if (self._agent is None and self._start_error is not None
+                    and self.conversation_id is not None
+                    and is_corrupt_conversation_error(self._start_error)):
                 self.conversation_id = None
-                self._start_attempted = False
                 self._start_error = None
                 await self.start()
-                if self.conversation_id is None and self._agent is not None:
-                    cid = getattr(self._agent, "conversation_id", None)
-                    if cid:
-                        self.conversation_id = cid
-        if self._agent is not None and not self._recorded_init:
-            self._recorded_init = True
-            # Replay persisted SDK history first, then capture the FULL system
-            # prompt and tool set so the trace shows prompts + tools + history.
-            self._hydrate_transcript_from_sdk()
-            self._record("system", "system_prompt", text=self._si)
-            tools = []
-            for t in types.BuiltinTools.minimal():
-                tools.append(getattr(t, "name", str(t)))
-            tool_line = "enabled: " + (", ".join(tools) or "（无）") + " (+ finish)"
-            if BACKEND == "cloud":
-                tool_line += " [cloud: run_command sandbox]"
-            self._record("system", "tools", text=tool_line)
-            self._record_sandbox_status()
-        return self._agent is not None
+            if self._agent is None:
+                self._start_state = "failed"
+                self._start_failed_at = time.monotonic()
+                return False
+            # If the SDK created a brand-new conversation (we did NOT pass a
+            # conversation_id to resume), capture the id it assigned so later
+            # turns / process restarts resume THIS session instead of failing
+            # with "conversation ... not found ... cannot resume".
+            if self.conversation_id is None:
+                cid = getattr(self._agent, "conversation_id", None)
+                if cid:
+                    self.conversation_id = cid
+            self._start_state = "ready"
+            if not self._recorded_init:
+                self._recorded_init = True
+                # Replay persisted SDK history first, then capture the FULL system
+                # prompt and tool set so the trace shows prompts + tools + history.
+                self._hydrate_transcript_from_sdk()
+                self._record("system", "system_prompt", text=self._si)
+                tools = []
+                for t in types.BuiltinTools.minimal():
+                    tools.append(getattr(t, "name", str(t)))
+                tool_line = "enabled: " + (", ".join(tools) or "（无）") + " (+ finish)"
+                if BACKEND == "cloud":
+                    tool_line += " [cloud: run_command sandbox]"
+                self._record("system", "tools", text=tool_line)
+                self._record_sandbox_status()
+            return True
 
     def _offline_msg(self, action):
         msg = f"⚠ 该蛋的 LLM 未连接，无法{action}。"
@@ -619,8 +651,7 @@ class EggAgent:
             msg += f"\n原因：{err}"
             # A recoverable session-state problem (persisted conversation_id missing
             # in save_dir) should NOT be misreported as a backend/model outage.
-            if "conversation" in err and ("not found" in err or "cannot resume" in err
-                                          or "resume" in err):
+            if is_corrupt_conversation_error(self._start_error):
                 msg += "\n（会话状态文件丢失；下次对话将自动以新会话开始。）"
                 return msg
         msg += "\n请确认 IDEA_BACKEND 与本地/云端模型可用（openai 后端需 :9000 服务在跑）。"
@@ -795,12 +826,10 @@ class EggAgent:
         self._turn_tool_calls = 0
         self._got_tool_result = False
         self._tc_seen = {"hook": {}, "chunk": {}}
-        # Has this egg EVER invoked a file-writing tool? Used to tell a genuine
-        # chat-only egg (reply is the deliverable) from an egg that tried to
-        # produce files and failed to leave any behind. Deliberately NOT reset
-        # per run: a retry must not dodge the artifact requirement by quietly
-        # skipping the file tools it failed with on the previous attempt.
-        self._used_file_tools = False
+        # NB: _used_file_tools is deliberately NOT reset per chat attempt here —
+        # it is reset once per RUN in run(). A retry must not dodge the artifact
+        # requirement by quietly skipping the file tools it failed with on a
+        # previous attempt.
         self._last_instruction = ""
         # Per-run guard against a model that repeats the same tool call forever
         # (observed with small local models: 10+ identical create_file retries).
@@ -839,7 +868,37 @@ class EggAgent:
             except Exception:
                 self._last_stop_reason = None
 
-    async def _heal_conversation(self, err):
+    def _find_corrupt_turns(self):
+        """Step indices of persisted assistant turns with neither content nor
+        tool_calls — the exact shape the model server rejects with HTTP 400.
+
+        Verifying the poison exists BEFORE rebuilding avoids blindly nuking a
+        healthy conversation on an unrelated 400 (oversized request, malformed
+        tool schema, ...).
+        """
+        bad = []
+        if self._agent is None:
+            return bad
+        try:
+            steps = list(self._agent.conversation.history)
+        except Exception:
+            return bad
+        # history appends every UPDATE of a step; keep the final update per index.
+        latest = {}
+        for step in steps:
+            latest[step.step_index] = step
+        for i in sorted(latest):
+            s = latest[i]
+            try:
+                if s.source == types.StepSource.USER:
+                    continue
+            except Exception:
+                pass
+            if not s.content and not s.tool_calls:
+                bad.append(i)
+        return bad
+
+    async def _heal_conversation(self, err, verify=True):
         """Reset a corrupt/invalid SDK conversation so the next chat() starts fresh.
 
         The SDK persists the LLM session under ``save_dir`` keyed by
@@ -851,10 +910,25 @@ class EggAgent:
         Dropping ``conversation_id`` forces a brand-new conversation that does not
         replay the broken history, so the egg recovers instead of erroring forever
         (which otherwise leaves it stuck "运行中" with an empty box).
+
+        With ``verify=True`` the persisted history is scanned for the poisoned
+        turn first; if no corrupt turn is found the 400 has another cause and
+        the conversation is left untouched (returns False). Pass
+        ``verify=False`` when the caller has direct evidence of an incomplete
+        turn (e.g. a turn that streamed nothing).
         """
         e = str(err)
         if not is_corrupt_conversation_error(e):
             return False
+        if verify:
+            bad = self._find_corrupt_turns()
+            if not bad:
+                logger.warning("[egg %s] 400 looked corrupt but no empty "
+                               "assistant turn found; keeping conversation",
+                               self.id)
+                return False
+            logger.info("[egg %s] confirmed corrupt turn(s) at steps %s",
+                        self.id, bad)
         # Close the OLD session in the BACKGROUND: `Agent.__aexit__` tears down
         # the harness conversation and can BLOCK for a while. Doing it inline
         # would hold the egg's lock (and the WS event stream) hostage — the egg
@@ -864,7 +938,8 @@ class EggAgent:
         self._cm = None
         self._agent = None
         self.conversation_id = None
-        self._start_attempted = False
+        self._start_state = "stopped"
+        self._start_failed_at = 0.0
         if old_cm is not None:
             asyncio.ensure_future(_aclose_quiet(old_cm))
         try:
@@ -872,12 +947,66 @@ class EggAgent:
             if self._agent is not None:
                 cid = getattr(self._agent, "conversation_id", None)
                 self.conversation_id = cid or uuid.uuid4().hex
+                self._start_state = "ready"
             else:
                 self.conversation_id = uuid.uuid4().hex
-        except Exception:
+                self._start_state = "failed"
+                self._start_failed_at = time.monotonic()
+        except Exception as reopen_exc:
             self._cm = None
             self._agent = None
+            self._start_state = "failed"
+            self._start_failed_at = time.monotonic()
+            self._start_error = reopen_exc
         return True
+
+    async def _probe_model_server(self):
+        """Classify model-server health after a stall/timeout.
+
+        Distinguishes "we canceled waiting" from "the server is stuck":
+        llama.cpp streams nothing during prefill and cannot detect a client
+        disconnect mid-prefill, so an aborted request may keep burning its
+        slot. Returns "ok" (reachable, idle slot), "busy" (reachable, all
+        slots processing — likely the zombie request), "down" (unreachable),
+        or "unknown" (no base_url configured).
+        """
+        base = str(backend_options().get("base_url") or "").rstrip("/")
+        if not base:
+            return "unknown"
+
+        def _get(path):
+            req = urllib.request.Request(base + path)
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return json.loads(r.read().decode())
+
+        try:
+            try:
+                slots = await asyncio.to_thread(_get, "/slots")
+            except Exception:
+                # llama.cpp serves /slots; other servers may not — /models is
+                # the OpenAI-standard liveness endpoint.
+                await asyncio.to_thread(_get, "/models")
+                return "ok"
+            if any(s.get("is_processing") for s in slots):
+                return "busy"
+            return "ok"
+        except Exception:
+            return "down"
+
+    async def _wait_for_slot_release(self, budget=30.0):
+        """Poll until the server has an idle slot (or the budget expires).
+
+        Bounded on purpose: if the server stays busy we report rather than
+        pile more requests onto it. We never restart the server ourselves —
+        that decision belongs to the operator.
+        """
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            state = await self._probe_model_server()
+            if state != "busy":
+                return state
+            await asyncio.sleep(2.0)
+        return "busy"
 
     async def run(self, text, context=None):
         """Stream the model's real response for a command inside this egg.
@@ -892,6 +1021,10 @@ class EggAgent:
         self._last_tc_sig, self._tc_repeat, self._loop_guard = None, 0, False
         self._stalls = 0
         self._last_instruction = text
+        # Reset once per RUN (not per retry attempt): see the comment in
+        # _chat_once. Accumulates across attempts so a retry that skips file
+        # tools cannot erase evidence that an earlier attempt tried them.
+        self._used_file_tools = False
         self._run_failed = False
         self._run_error = None
         self._run_canceled = False
@@ -1016,11 +1149,27 @@ class EggAgent:
                         # so the NEXT command starts from a clean one instead of
                         # failing forever.
                         if not self._turn_payload:
-                            print(f"[egg {self.id}] empty model turn -> "
-                                  f"resetting conversation to avoid HTTP 400")
-                            await self._heal_conversation(
-                                "Assistant message must contain either "
-                                "'content' or 'tool_calls'!")
+                            logger.warning(
+                                "[egg %s] empty model turn -> resetting "
+                                "conversation to avoid HTTP 400", self.id)
+                            # The abort may have left a zombie prefill burning
+                            # a server slot; wait for release before reopening
+                            # the harness (its startup ping would stall too).
+                            state = await self._probe_model_server()
+                            if state == "busy":
+                                yield ("\n⏳ 服务端仍在处理被中止的请求，"
+                                       "等待槽位释放…\n")
+                                state = await self._wait_for_slot_release()
+                            if state == "down":
+                                yield ("\n⚠ 模型服务不可达，会话保留；"
+                                       "请恢复 :9000 服务后重试。\n")
+                            else:
+                                # Direct evidence of an incomplete turn: the
+                                # stream produced nothing, so skip the scan.
+                                await self._heal_conversation(
+                                    "Assistant message must contain either "
+                                    "'content' or 'tool_calls'!",
+                                    verify=False)
                         # A file task answered with text only is a HALLUCINATED
                         # completion: nudge the SAME conversation once to
                         # actually write the deliverable before giving up.
@@ -1044,12 +1193,36 @@ class EggAgent:
                         self._run_failed = True
                         self._run_error = "turn timeout"
                         yield f"\n⚠ 本次运行超时（{_TURN_TIMEOUT:g}s），已停止。\n"
+                        # Distinguish "we canceled waiting" from "server is
+                        # stuck": an aborted prefill keeps its slot busy.
+                        state = await self._probe_model_server()
+                        if state == "busy":
+                            yield "⏳ 服务端仍在处理被中止的请求，等待槽位释放…\n"
+                            state = await self._wait_for_slot_release()
+                        if state == "down":
+                            yield "⚠ 模型服务不可达，请检查 :9000 服务。\n"
                         return
                     except Exception as ex:
+                        # A stream-stall abort can leave a zombie prefill on the
+                        # server; probing before retrying avoids piling requests
+                        # onto a busy server (which re-triggers the watchdog).
+                        if is_stream_stall_error(ex):
+                            state = await self._probe_model_server()
+                            if state == "busy":
+                                yield ("\n⏳ 服务端仍在处理被中止的请求，"
+                                       "等待槽位释放…\n")
+                                state = await self._wait_for_slot_release()
+                            if state == "down":
+                                self._run_failed = True
+                                self._run_error = str(ex)
+                                yield ("\n⚠ 模型服务不可达，已停止；"
+                                       "请检查 :9000 服务后重试。\n")
+                                return
                         # A corrupt/invalid conversation (e.g. an empty assistant
                         # message -> HTTP 400) cannot be retried in place; heal it
                         # (fresh conversation) so the egg recovers instead of
-                        # erroring forever and staying stuck "运行中".
+                        # erroring forever and staying stuck "运行中". Healing
+                        # first VERIFIES the poisoned turn actually exists.
                         healed = await self._heal_conversation(ex)
                         if healed and self._agent is None:
                             yield f"\n⚠ 无法重建会话，已停止：{ex}\n"
@@ -1155,10 +1328,23 @@ class EggAgent:
         run = models.TaskRun(
             task_id=self.id, agent_id=self.id, status=status,
             start_time=self._run_started, end_time=now, error=error)
+        # Load the previous run's task BEFORE building the fresh one so state
+        # accumulated across runs survives a DIRECT egg command (the UI "command"
+        # panel calls egg.run() without going through the orchestrator's
+        # dispatch, which is the only path that otherwise re-merges runs back).
+        previous = self._store.load(self.id) if self._store is not None else None
         task = models.Task(
             task_id=self.id, title=self.title, description=self.prompt,
             owner_agent_id=self.id, status=models.TaskStatus.PLANNED,
             metadata={"worktree": str(self.worktree)})
+        if previous is not None:
+            # Preserve the commander's confirmation across direct commands.
+            task.confirmed = previous.confirmed
+            # Keep every finished run from history; drop only the RUNNING
+            # placeholder (the current run is appended below).
+            task.runs.extend(
+                r for r in previous.runs
+                if r.status != models.ExecutionStatus.RUNNING)
         task.runs.append(run)
 
         # Permission gate (link.md 一.6): an egg may only write its own task.
@@ -1168,7 +1354,6 @@ class EggAgent:
             error = error or "permission denied"
             task.metadata["blocked_reason"] = "agent lacks write permission"
 
-        previous = self._store.load(self.id) if self._store is not None else None
         # Version high-water marks survive a task reset (they live in metadata
         # because _reset_task clears the artifact list for the next attempt).
         versions: dict[str, int] = {}
@@ -1221,6 +1406,12 @@ class EggAgent:
                 task.status = models.TaskStatus.RUNNING
 
             if task_status == models.TaskStatus.SUCCESS:
+                # Validate artifacts FIRST so they reach GENERATED before
+                # evaluate_acceptance -> mark_artifacts moves them to ACCEPTED.
+                # Otherwise mark_artifacts sees NOT_GENERATED (its whitelist
+                # excludes it) and skips them, leaving artifacts stuck at
+                # GENERATED after evaluate_task_completed re-validates.
+                acceptance.validate_artifacts(task.artifacts, task)
                 passed = acceptance.evaluate_acceptance(task.acceptance, task)
                 if not passed:
                     task_status = models.TaskStatus.FAILED
