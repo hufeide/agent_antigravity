@@ -524,11 +524,12 @@ Rules:
                 enabled_tools=types.BuiltinTools.none(), enable_subagents=False,
                 agent_behavior=types.AgentBehavior.MINIMAL))
         async with Agent(config) as agent:
-            response = await agent.chat(f"Goal: {goal}")
-            data = await response.text()
+            response = await agent.chat(f"Goal: {goal}") 
             data = await response.structured_output()
             if not isinstance(data, dict):
+                data = await response.text()
                 data = _extract_json(await response.text())
+            
         if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
             raise ValueError("planner response must contain a tasks list")
         return _normalize_plan_items(data["tasks"], min_tasks=2)
@@ -1153,6 +1154,7 @@ Your available actions (pick exactly ONE, output it in the "action" field):
 CRITICAL rules:
 - You are a DECISION-MAKER ONLY. You do NOT use tools, create tasks, or execute anything. Your response is just a JSON object describing what should happen.
 - For "replan", simply DESCRIBE new tasks in JSON. Do NOT attempt to call any tool or create anything yourself.
+- In depends_on, ALWAYS reference existing eggs by their exact TITLE, never by their id. Only reference titles of tasks you are creating in this same plan, or titles already on the canvas.
 - Questions like "需要产物吗" or "进度如何" are answer actions, not run actions.
 - Never infer completion from a status string alone; use TaskCompleted and artifacts/report fields.
 - Include brief reasoning and a concise reply in the JSON.
@@ -1166,9 +1168,9 @@ CRITICAL rules:
                 agent_behavior=types.AgentBehavior.MINIMAL))
         async with Agent(config) as agent:
             response = await agent.chat(text)
-            # data = await response.text()
             data = await response.structured_output()
             if not isinstance(data, dict):
+                data = await response.text()
                 data = _extract_json(await response.text())
         if not isinstance(data, dict):
             raise ValueError("commander decision must be a JSON object")
@@ -1216,7 +1218,34 @@ CRITICAL rules:
                 continue
             existing_title_lists.setdefault(egg.title, []).append(egg)
         duplicates = {title for title, values in existing_title_lists.items() if len(values) > 1}
+        # The commander is shown each egg's id AND title, so it may reference an
+        # existing egg by id in depends_on. Resolve those ids to titles here —
+        # the validator only understands titles — skipping eggs the operator
+        # asked to remove so a dep on a soon-to-be-deleted egg still fails.
+        id_to_title = {egg.id: egg.title for egg in self.eggs.values()
+                       if egg.id not in remove_set}
         try:
+            def _resolve_dep_ids(task):
+                if not isinstance(task, dict):
+                    return task
+                deps = task.get("depends_on")
+                if not isinstance(deps, list):
+                    return task
+                resolved, changed = [], False
+                for dep in deps:
+                    key = str(dep or "").strip()
+                    mapped = id_to_title.get(key)
+                    if mapped is not None:
+                        resolved.append(mapped)
+                        changed = True
+                    else:
+                        resolved.append(key)
+                if changed:
+                    task = dict(task)
+                    task["depends_on"] = resolved
+                return task
+
+            raw_tasks = [_resolve_dep_ids(task) for task in raw_tasks]
             normalized = _normalize_plan_items(
                 raw_tasks, available_titles=set(existing_title_lists), max_tasks=5)
             collisions = [title for title, _prompt, _deps in normalized
