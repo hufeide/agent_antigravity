@@ -21,6 +21,10 @@
    - [acceptance.py — 交付物验收](#46-acceptancepy--交付物验收)
    - [completion.py — 完成判定规则](#47-completionpy--完成判定规则)
    - [main.py — 端到端装配演示](#48-mainpy--端到端装配演示)
+   - [a2a.py — A2A 协议层（跨网络）](#49-a2apy--a2a-协议层跨网络)
+   - [a2a_antigravity_server.py — 独立 Antigravity A2A 服务](#410-a2a_antigravity_serverpy--独立-antigravity-a2a-服务)
+   - [a2a_graph.py — LangGraph 多 A2A Agent 组合](#411-a2a_graphpy--langgraph-多-a2a-agent-组合)
+   - [a2a_test.py — 真实 LLM 端到端测试](#412-a2a_testpy--真实-llm-端到端测试)
 5. [canvas 子项目（IdeaCanvas）](#5-canvas-子项目ideacanvas)
 6. [SDK 逐项对应关系](#6-sdk-逐项对应关系)
 7. [运行方式](#7-运行方式)
@@ -109,6 +113,10 @@ demo/
 ├── acceptance.py        # 交付物验收：文件校验 + 结构化验收标准执行
 ├── completion.py        # 完成判定：单任务完成规则 + 全局收敛报告
 ├── main.py              # 端到端装配演示（串联所有模块）
+├── a2a.py               # A2A 协议层：AgentCard/executor/server/client/dispatch（跨网络）
+├── a2a_antigravity_server.py  # 独立 Antigravity A2A 服务（常驻，后端 llama.cpp）
+├── a2a_graph.py         # LangGraph 组合多个远程 A2A agent（路由分发）
+├── a2a_test.py          # 真实 LLM（llama.cpp 9000）端到端测试 a2a.py
 ├── link.md              # 设计文档（框架的目标蓝图）
 ├── README.md            # 框架 README
 ├── TECHNICAL_DOC.md     # 本技术文档
@@ -324,6 +332,15 @@ async with Agent(config) as agent:
 - 成功置 `ExecutionStatus.FINISHED` + `TaskStatus.SUCCESS`；失败置 `ERROR` + `FAILED` 并 re-raise。
 - 返回文本即任务执行结果（link.md 五：ExecutionFinished 代理）。
 
+#### `with_conversation(config, conversation_id, *, save_dir=None) -> Any`
+
+把 A2A 的 `context_id` 映射为 SDK `conversation_id`，返回一个**逐调用**配置副本，让 LLM 跨请求保持记忆（供 `a2a.make_sdk_executor` 使用）。
+
+- 用 `config.model_copy(update={...})` 设置 `conversation_id` + `session_continuation_mode=CREATE_OR_RESUME`（会话不存在则创建，存在则续接）。
+- **关键**：必须配合**固定 `save_dir`**——SDK 把会话持久化到 `<save_dir>/<conversation_id>.db`，否则每次 `run_task` 新建的 Agent 子进程退出时会话状态丢失，记忆失效。
+- `conversation_id` 为 None 或 SDK 不可用时返回原 config 不变（模拟执行器路径不受影响）。
+- 这也是 `a2a_test.py` 验证「LLM 会话记忆（真实续接）」的机制（见 4.12）。
+
 ---
 
 ### 4.5 infrastructure.py — 全局基础设施
@@ -502,6 +519,109 @@ python -m demo.main --live
 5. `orch.arun(dispatch)`：异步并发调度（`simulate_dispatch` 模拟 Agent 执行 + 验收 + 复命）。
 6. 逐任务 `evaluate_task_completed` + `global_report` 全局收敛。
 7. `AuditLog` / `Metrics` 汇总。
+
+---
+
+### 4.9 a2a.py — A2A 协议层（跨网络）
+
+> SDK status: **是**（官方 `a2a` Python SDK）。把本地执行器暴露为 A2A 1.0 服务并可经网络远程调用、复命，对应 link.md「四.第二层网络扩展 / 一.4 消息通信」。
+
+实现第二层的**跨网络**扩展：用官方 `a2a` SDK 把本地 Agent 执行器包装为可被远程调用的 A2A agent，并经 `A2AClient` 远程调用其他 A2A agent。
+
+#### `build_agent_card(name, description, url, *, ...) -> AgentCard`
+
+构建真实 `AgentCard`（声明 JSONRPC 接口、协议版本 1.0、能力、输入/输出模式）。card 是 agent 的身份与能力契约，客户端据此发现如何连接与对话。
+
+#### `A2ATaskExecutor`（AgentExecutor 实现）
+
+把本地执行回调包装为 A2A `AgentExecutor`，按 A2A 协议流式输出 Task 生命周期：
+
+- `execute(context, event_queue)`：先入队完整 `Task` 对象（SUBMITTED），再发 WORKING → artifact → COMPLETED/FAILED/CANCELED。**协议要求 Task 对象须先于任何 `TaskStatusUpdateEvent` 到达客户端**，否则触发 `InvalidAgentResponseError`。
+- `context.task_id` / `context.context_id` 对新建任务已由 `RequestContext` 生成（`current_task` 为 None）。
+- 把 A2A `context_id` 透传给执行回调——这是第二层协作的关键：执行器据此映射 SDK conversation 实现 LLM 记忆（见 4.4 `with_conversation`）。
+
+#### `A2AServer`
+
+用 `create_jsonrpc_routes` / `create_rest_routes` / `create_agent_card_routes` / `add_a2a_routes_to_fastapi` 把执行器暴露为 A2A 服务（JSONRPC + REST + `/.well-known/agent-card.json` 发现），uvicorn 后台线程启动。
+
+- `start() -> str`：后台线程启动，返回服务 URL。
+- `stop()`：优雅停止。
+
+#### `A2AClient`
+
+官方客户端封装，聚合流式 `message` / `artifact_update` / `status_update` / `task` 事件为单个 `A2AReply`。
+
+- `connect(url)`：从 `/.well-known/agent-card.json` 解析 card 并建立连接。
+- `send(prompt, *, context_id, task_id, timeout) -> A2AReply`：发送一条消息；传回上一轮的 `context_id` 可延续同一远程会话。`timeout` 透传为 `ClientCallContext`（真实 LLM 后端较慢，需长超时，否则 `A2AClientTimeoutError`）。
+- `A2AReply`：`text / state / task_id / context_id / artifacts`。
+
+#### `a2a_dispatch(client, task, *, sender, bus, audit, context_id, timeout) -> str`
+
+作为 `Orchestrator` 的 dispatch 回调：经 A2A 远程执行任务，把结果回写 Task（复命 REPORT），可挂 `MessageBus` / 审计。
+
+#### `make_sdk_executor(config, *, agent_id, conversation_save_dir) -> Callable[[str, str | None], Awaitable[str]]`
+
+把 `agent_runtime.run_task` 包装成 A2A 执行回调，实现真实 SDK agent 的远程化。核心：把 A2A `context_id` 经 `agent_runtime.with_conversation` 映射为 SDK `conversation_id`，配合 `CREATE_OR_RESUME` + 固定 `save_dir` 让 LLM 真正续接同一会话（跨请求记忆）。`conversation_save_dir` 提供会话持久化（见 4.4）。
+
+> 执行器回调签名统一为 `Callable[[str, str | None], ...]`：接收 prompt 与 A2A `context_id`。
+
+---
+
+### 4.10 a2a_antigravity_server.py — 独立 Antigravity A2A 服务
+
+把 `agent_runtime.run_task`（经 llama.cpp 9000 的真实 LLM）用 `make_sdk_executor` 包装，经 `A2AServer` 暴露为一个**常驻** A2A 1.0 agent（card 名 `Antigravity-Assistant`，JSONRPC 于 `/`，协议 1.0，流式），供 `a2a_graph.py` 等客户端跨网络调用。与 `a2a_test.py` 的区别是**常驻服务**而非一次性测试。
+
+**运行**：`python -m demo.a2a_antigravity_server --port 9998`（需 llama-server 在 9000 端口提供 OpenAI 兼容 `/v1`）。
+
+- 自动从 `/v1/models` 发现模型；创建临时 `conversation_save_dir` 持久化会话（LLM 记忆）。
+- 支持脚本与模块两种运行方式（含 sys.path 引导，见 8.14）。
+
+---
+
+### 4.11 a2a_graph.py — LangGraph 多 A2A Agent 组合
+
+用 `langgraph.graph.StateGraph` 组合两个远程 A2A agent，构建**路由分发**图：
+
+```
+START → route → { friday | antigravity } → END
+```
+
+- **Friday**（AgentScope A2A 服务，默认 `http://127.0.0.1:9999`）：通用助手。
+- **Antigravity-Assistant**（本仓库 `a2a_antigravity_server`，默认 `http://127.0.0.1:9998`）：技术/编程助手（后端 llama.cpp 9000）。
+
+`route` 节点按关键词把 query 分派给合适 agent；各 agent 节点经 `A2AClient` 跨网络调用，各自保留 `context_id` 支持多轮记忆。仅一个服务在线时图自动退化为单 agent；支持 `--agent` 强制指定、`--query` 单条运行。
+
+**运行**：
+
+```sh
+# 先启动两个服务
+python -m demo.a2a_antigravity_server --port 9998
+python <agentscope>/examples/a2a/server.py --port 9999
+# 再运行图
+python -m demo.a2a_graph
+python -m demo.a2a_graph --query "帮我用 Python 写一个快速排序"
+```
+
+---
+
+### 4.12 a2a_test.py — 真实 LLM 端到端测试
+
+用 llama.cpp（端口 9000）的真实 LLM 测试 `a2a.py` 的全部核心路径。用 `build_agent_config(backend="openai", base_url="http://127.0.0.1:9000/v1", ...)` 构建指向 llama.cpp 的 `LocalOpenAIAgentConfig`，自动从 `/v1/models` 发现模型；用 `make_sdk_executor(config, conversation_save_dir=...)` 把真实 `run_task` 包装成 A2A 执行器。
+
+**运行**：`python -m demo.a2a_test`（或直接 `python demo/a2a_test.py`）。
+
+**测试覆盖（全部经真实 LLM）**：
+
+| 测试 | 说明 |
+| --- | --- |
+| 1. 端到端往返 | 真实 LLM 回答经 A2A 协议回传 |
+| 2. context_id 延续（协议层） | 同一远程会话两轮 context_id 一致 |
+| 2b. LLM 会话记忆（真实续接） | 第二轮回复真实含第一轮告知的数字（会话被续接而非每次新建） |
+| 3. Orchestrator 远程分派+复命 | 经 `a2a_dispatch` 远程执行，结果写回 Task（report_payload） |
+| 3b. REPORT 复命入总线 | REPORT 消息发布到 MessageBus |
+| 4. 流式事件聚合 | `state=COMPLETED` + artifact 非空 |
+
+> 直接以脚本方式运行（`python demo/a2a_test.py`）需 sys.path 引导：把脚本目录 `demo/` 从 `sys.path` 移除，避免其遮蔽已安装的顶层 `a2a` SDK 包（见 8.14）。
 
 ---
 
@@ -699,6 +819,7 @@ GEMINI_API_KEY=... python run.py
 | acceptance | 交付物验收 | 否 | 占位（stdlib 文件校验 + 结构化输出近似） |
 | completion | 完成判定规则 | 部分 | ExecutionFinished 用 SDK StepStatus 近似，其余占位 |
 | main | 总体装配 | — | 串联以上模块 |
+| a2a | A2A 协议层（跨网络） | **是**（官方 a2a SDK） | AgentExecutor/DefaultRequestHandler/InMemoryTaskStore、create_jsonrpc_routes/create_rest_routes/create_agent_card_routes/add_a2a_routes_to_fastapi、ClientFactory/ClientConfig/BaseClient、A2ACardResolver、AgentCard/AgentInterface/Message/Part/Task/TaskState |
 
 **SDK 直接复用的关键原语**：
 
@@ -712,6 +833,7 @@ GEMINI_API_KEY=... python run.py
 - `conversation_id` / `save_dir` / `app_data_dir`（会话持久化与恢复）
 - `utils.otel.get_otel_hooks` / `UsageMetadata`
 - `interactive.AskQuestionHook`（人工审批）
+- 官方 `a2a` SDK：`AgentExecutor` / `DefaultRequestHandler` / `InMemoryTaskStore` / `TaskUpdater` / `RequestContext` / `EventQueue`；`create_jsonrpc_routes` / `create_rest_routes` / `create_agent_card_routes` / `add_a2a_routes_to_fastapi`；`ClientFactory` / `ClientConfig` / `BaseClient` / `ClientCallContext` / `A2ACardResolver`；`AgentCard` / `AgentInterface` / `AgentCapabilities` / `AgentSkill` / `Message` / `Part` / `Role` / `Task` / `TaskStatus` / `TaskState` / `TaskStatusUpdateEvent` / `TaskArtifactUpdateEvent` / `SendMessageRequest`
 
 ---
 
@@ -733,6 +855,25 @@ python -m demo.main
 # 真正调用 SDK 的 Agent（需要编译型运行时二进制 + GEMINI_API_KEY）
 python -m demo.main --live
 ```
+
+### A2A 服务与多 Agent 组合
+
+需要 llama.cpp（或任意 OpenAI 兼容服务器）在 9000 端口提供 `/v1` 接口。
+
+```sh
+# 1) 独立 Antigravity A2A 服务（常驻，默认 :9998）
+python -m demo.a2a_antigravity_server --port 9998
+
+# 2) 真实 LLM 端到端测试 a2a.py（一次性）
+python -m demo.a2a_test
+
+# 3) LangGraph 组合两个远程 A2A agent（需先启动 Friday 等另一服务）
+python -m demo.a2a_graph
+python -m demo.a2a_graph --query "帮我用 Python 写一个快速排序"
+python -m demo.a2a_graph --agent friday --query "你好"
+```
+
+> A2A 客户端对真实 LLM 后端需长超时：`A2AClient.send(..., timeout=...)` 与 `a2a_dispatch(..., timeout=...)` 透传 `ClientCallContext(timeout=...)`。
 
 ### IdeaCanvas 画布应用
 
@@ -801,6 +942,10 @@ IDEA_BACKEND=litert GEMMA4_MODEL_PATH=~/.litert-lm/models/gemma4-26b/model.liter
 
 14. **sys.path 修正**（`demo/__init__.py`）：仓库源码树缺少安装时生成的 `*_pb2` 模块，会让 `import google.antigravity` 解析到源码树而失败；`_prefer_installed_sdk` 把仓库根移到 `sys.path` 后部，让 pip 安装的 SDK 优先。
 
+15. **A2A context_id → SDK conversation_id 映射（LLM 记忆）**：A2A 的协议层 `context_id` 延续不等于 LLM 记忆——每次 `run_task` 新建的 Agent 子进程会丢失会话状态。`agent_runtime.with_conversation` 把 A2A `context_id` 映射为 SDK `conversation_id`，配合 `CREATE_OR_RESUME` + 固定 `save_dir`（会话落盘到 `<save_dir>/<conversation_id>.db`），让 LLM 跨 A2A 请求真正续接同一会话。`make_sdk_executor(config, conversation_save_dir=...)` 是其接入点。
+
+16. **`demo/a2a.py` 同名遮蔽**：直接以脚本方式运行（`python demo/a2a_test.py`）时，Python 把脚本目录 `demo/` 放入 `sys.path`，而 `demo/` 内有一个 `a2a.py`，会**遮蔽已安装的顶层 `a2a` SDK 包**（同名）。于是 `import a2a` 解析到 `demo/a2a.py`，它作为顶层模块再做相对导入即报「无父包」。修复：脚本引导时把脚本目录 `demo/` 从 `sys.path` 移除，只保留 repo_root（见 `a2a_test.py` / `a2a_antigravity_server.py` / `a2a_graph.py` 顶部引导）。
+
 ---
 
 ## 附：模块依赖关系
@@ -813,6 +958,12 @@ main.py
  ├─ completion.py ───── models.py ── acceptance.py
  ├─ infrastructure.py ─ models.py ── (google.antigravity SDK)
  └─ messaging.py ────── models.py（仅类型引用）
+
+a2a.py ────────────── agent_runtime.run_task/with_conversation + models
+             + (官方 a2a SDK)
+a2a_antigravity_server.py ─ a2a.A2AServer + make_sdk_executor + agent_runtime
+a2a_graph.py ───────────── a2a.A2AClient + (langgraph)
+a2a_test.py ────────────── a2a.A2AServer/A2AClient/a2a_dispatch + agent_runtime + orchestrator/messaging/models
 
 canvas/
  ├─ config.py ───────── agent_runtime.build_agent_config
