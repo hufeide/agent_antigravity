@@ -11,7 +11,8 @@
 测试覆盖（全部经真实 LLM，非模拟执行器）：
     1. 端到端往返：A2AServer 用 make_sdk_executor 包装 agent_runtime.run_task，
        A2AClient 调用，验证真实 LLM 回答经 A2A 协议回传。
-    2. A2A context_id 延续：同一远程会话连续两轮对话，context_id 保持一致。
+    2. A2A context_id 延续 + LLM 会话记忆：同一远程会话连续两轮，context_id
+       保持一致，且第二轮回复真实含第一轮告知的数字（会话被续接而非每次新建）。
     3. Orchestrator 远程分派 + 复命：经 a2a_dispatch 把任务发给远程 A2A agent，
        结果写回 Task（report_payload）并发布 REPORT 消息到总线。
     4. 流式事件聚合：reply.state == COMPLETED、reply.artifacts 非空。
@@ -22,6 +23,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import tempfile
+from pathlib import Path
+
+# Allow running both as `python -m demo.a2a_test` and as a plain script
+# (`python demo/a2a_test.py`). A plain script has no parent package, so we
+# establish the demo package context and make the repo root importable first.
+# Crucially we also drop the script dir (demo/) from sys.path: it shadows the
+# installed top-level `a2a` SDK package with demo/a2a.py (same basename),
+# which then fails its own relative imports. Importing demo also runs
+# demo/__init__.py (_prefer_installed_sdk), which makes the installed
+# google.antigravity SDK win over this repo's source tree.
+if __package__ in (None, ""):
+    _here = Path(__file__).resolve().parent        # demo/
+    _repo_root = _here.parent                        # repo root
+    sys.path[:] = [
+        p for p in sys.path
+        if (Path(p) if p else Path.cwd()).resolve() != _here
+    ]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    __package__ = "demo"
 
 import httpx
 
@@ -62,9 +84,9 @@ def _discover_model() -> str:
 async def _build_config(model: str):
     """构建指向 llama.cpp 的真实 SDK 配置（OpenAI 兼容后端）。
 
-    不固定 conversation_id：SDK 默认以 RESUME 模式恢复会话，首次调用会因
-    会话不存在而失败。每次 A2A 消息创建全新会话即可（context 延续由 a2a.py
-    的协议层 context_id 负责，不依赖 LLM 记忆）。
+    基础 config 不绑定 conversation_id；A2A 的 context_id 由 make_sdk_executor
+    经 agent_runtime.with_conversation 逐调用映射为 SDK conversation_id，并配合
+    CREATE_OR_RESUME + 固定 save_dir 让 LLM 真正续接同一会话（保持记忆）。
     """
     return build_agent_config(
         SYSTEM_PROMPT,
@@ -119,21 +141,32 @@ async def _test_round_trip(client: A2AClient, runner: _Runner) -> None:
 
 
 async def _test_context_continuation(client: A2AClient, runner: _Runner) -> None:
-    """测试 2：同一远程会话的 context_id 延续。"""
+    """测试 2+2b：同一远程会话的 context_id 延续 + LLM 真实会话记忆。
+
+    第一轮让 LLM 记住数字 42；第二轮带同一 context_id 追问。协议层验证
+    context_id 保持一致，LLM 层验证第二轮回复真的含 "42"（会话被续接，
+    而非每次新建会话导致失忆）。
+    """
     first = await client.send("记住这个数字：42。", timeout=REQUEST_TIMEOUT)
-    logger.info("第一轮 context_id: %s", first.context_id)
+    logger.info("第一轮 context_id: %s | 回复: %r", first.context_id, first.text.strip()[:50])
     assert first.context_id, "第一轮应返回 context_id"
 
     second = await client.send(
-        "我刚才让你记住的数字是多少？",
+        "我刚才让你记住的数字是多少？只回答那个数字。",
         context_id=first.context_id,
         timeout=REQUEST_TIMEOUT,
     )
-    logger.info("第二轮 context_id: %s", second.context_id)
+    logger.info("第二轮 context_id: %s | 回复: %r", second.context_id, second.text.strip()[:80])
+
     runner.record(
-        "2.context_id 延续",
+        "2.context_id 延续(协议层)",
         second.context_id == first.context_id and bool(second.text.strip()),
         f"first={first.context_id[:8]}.. second={second.context_id[:8]}..",
+    )
+    runner.record(
+        "2b.LLM会话记忆(真实续接)",
+        "42" in second.text,
+        second.text.strip()[:60],
     )
 
 
@@ -199,8 +232,16 @@ async def main() -> int:
     config = await _build_config(model)
     logger.info("SDK 配置: %s (backend=openai, base_url=%s)", type(config).__name__, LLAMA_BASE)
 
+    # 持久化 SDK 会话：A2A context_id 映射的 LLM 对话须落盘，跨请求保留记忆。
+    conversation_save_dir = tempfile.mkdtemp(prefix="a2a-test-conv-")
+    logger.info("LLM 会话持久化目录: %s", conversation_save_dir)
+
     server = A2AServer(
-        make_sdk_executor(config, agent_id="llama-cpp-agent"),
+        make_sdk_executor(
+            config,
+            agent_id="llama-cpp-agent",
+            conversation_save_dir=conversation_save_dir,
+        ),
         name="llama-cpp-a2a-agent",
         description="A2A agent backed by llama.cpp on port 9000",
     )
@@ -221,4 +262,4 @@ async def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    asyncio.run(main())#sys.exit(asyncio.run(main()))

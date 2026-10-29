@@ -188,9 +188,13 @@ async def _resolve(value: Any) -> Any:
 class A2ATaskExecutor(AgentExecutor):
     """Wrap a local execution callback as a real A2A AgentExecutor.
 
-    executor (`Callable[[str], str | Awaitable[str]]`):
-        Receives the flattened user prompt and returns the execution result.
-        For real runs, wrap agent_runtime.run_task with make_sdk_executor().
+    executor (`Callable[[str, str | None], str | Awaitable[str]]`):
+        Receives the flattened user prompt and the A2A context_id (or None
+        for a brand-new conversation), and returns the execution result. The
+        context_id lets a real SDK executor map it to a persistent
+        conversation so the LLM keeps memory across requests (see
+        make_sdk_executor). For real runs, wrap agent_runtime.run_task with
+        make_sdk_executor().
 
     The executor streams one Task lifecycle to the caller: SUBMITTED ->
     WORKING -> (artifact) -> COMPLETED / FAILED / CANCELED. Task state is
@@ -200,7 +204,7 @@ class A2ATaskExecutor(AgentExecutor):
 
     def __init__(
         self,
-        executor: Callable[[str], str | Awaitable[str]],
+        executor: Callable[[str, str | None], str | Awaitable[str]],
         *,
         audit: Callable[..., None] | None = None,
     ) -> None:
@@ -236,7 +240,7 @@ class A2ATaskExecutor(AgentExecutor):
         )
 
         try:
-            result = await _resolve(self._executor(prompt))
+            result = await _resolve(self._executor(prompt, context_id))
         except asyncio.CancelledError:
             await _enqueue_status(
                 event_queue, task_id, context_id,
@@ -300,7 +304,7 @@ class A2AServer:
 
     def __init__(
         self,
-        executor: Callable[[str], str | Awaitable[str]],
+        executor: Callable[[str, str | None], str | Awaitable[str]],
         card: AgentCard | None = None,
         *,
         name: str = "a2a-agent",
@@ -505,18 +509,30 @@ class A2AClient:
 # Framework integration: remote execution + reporting (复命)
 # ---------------------------------------------------------------------------
 def make_sdk_executor(
-    config: Any, *, agent_id: str = "remote-a2a"
-) -> Callable[[str], Awaitable[str]]:
+    config: Any,
+    *,
+    agent_id: str = "remote-a2a",
+    conversation_save_dir: str | None = None,
+) -> Callable[[str, str | None], Awaitable[str]]:
     """Wrap agent_runtime.run_task as an A2A execution callback.
 
     The remote A2A server then executes real SDK agents: the prompt becomes a
     Task whose title drives agent_runtime.run_task (agent_runtime.py:237).
-    """
-    from .agent_runtime import run_task  # deferred: avoids circular imports
 
-    async def _execute(prompt: str) -> str:
+    The A2A ``context_id`` (passed by A2ATaskExecutor.execute) is mapped to a
+    SDK ``conversation_id`` via agent_runtime.with_conversation, so the LLM
+    keeps memory across requests that share the same context. Pass
+    ``conversation_save_dir`` to persist those conversations on disk; without
+    it each Agent subprocess loses session state when it exits (memory breaks).
+    """
+    from .agent_runtime import run_task, with_conversation  # deferred
+
+    async def _execute(prompt: str, context_id: str | None = None) -> str:
         task = models.Task(title=prompt, owner_agent_id=agent_id)
-        return await run_task(task, prompt, config)
+        call_config = with_conversation(
+            config, context_id, save_dir=conversation_save_dir
+        )
+        return await run_task(task, prompt, call_config)
 
     return _execute
 
@@ -594,8 +610,8 @@ async def a2a_dispatch(
 # ---------------------------------------------------------------------------
 # Demo
 # ---------------------------------------------------------------------------
-async def _simulated_executor(prompt: str) -> str:
-    logger.info("[remote-agent] received prompt: %.60s", prompt)
+async def _simulated_executor(prompt: str, context_id: str | None = None) -> str:
+    logger.info("[remote-agent] received prompt: %.60s (context=%s)", prompt, context_id)
     await asyncio.sleep(0.05)
     title = prompt.splitlines()[0] if prompt else "task"
     return f"模拟远程 agent 已完成：{title}"

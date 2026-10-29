@@ -234,6 +234,40 @@ def build_agent_config(
             kwargs.pop(k, None)
         return config_cls(**kwargs)
 
+
+def with_conversation(
+    config: Any,
+    conversation_id: str | None,
+    *,
+    save_dir: str | None = None,
+) -> Any:
+    """Return a per-call config copy bound to a persistent SDK conversation.
+
+    Maps an A2A context_id to a SDK conversation_id so the LLM keeps memory
+    across requests that share the same context. CREATE_OR_RESUME plus a
+    shared save_dir make the conversation persist across the fresh Agent
+    subprocess that each run_task spawns (agent_runtime.py:271); without a
+    fixed save_dir the session state is lost when the subprocess exits.
+
+    Returns *config* unchanged when conversation_id is None or the SDK is
+    unavailable (e.g. the simulated executor path).
+    """
+    if not SDK_AVAILABLE or not conversation_id:
+        return config
+    from google.antigravity.types import SessionContinuationMode
+
+    update: dict[str, Any] = {
+        "conversation_id": conversation_id,
+        "session_continuation_mode": SessionContinuationMode.CREATE_OR_RESUME,
+    }
+    if save_dir:
+        update["save_dir"] = save_dir
+    try:
+        return config.model_copy(update=update)
+    except Exception:  # config class may not support model_copy; fall back
+        return config
+
+
 async def run_task(
     task: "models.Task",
     prompt: str,
