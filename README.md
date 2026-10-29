@@ -21,6 +21,7 @@ python -m demo.main --live
 | `orchestrator.py` | 一.1 任务编排、二.7 依赖/死锁 | 否：无编排器；拓扑排序+环检测是纯 Python 实现 |
 | `messaging.py` | 一.4 消息通信与复命协议 | 否：无结构化消息类型 |
 | `agent_runtime.py` | 四.第二层 Agent 执行与协作 | **直接用 SDK**：Agent/LocalAgentConfig、SubagentConfig、policy(allow/deny/ask_user)、hooks、RetryConfig、response_schema、conversation_id、otel、AskQuestionHook |
+| `a2a.py` | 四.第二层 Agent 执行与协作 的网络扩展 / 一.4 消息通信（跨网络） | **直接用官方 A2A SDK**：AgentExecutor/DefaultRequestHandler/InMemoryTaskStore、create_jsonrpc_routes/create_rest_routes/create_agent_card_routes/add_a2a_routes_to_fastapi、ClientFactory/ClientConfig/BaseClient、A2ACardResolver、AgentCard/AgentInterface/Message/Part/Task/TaskState；把本地执行器暴露为 A2A 服务并可经网络远程调用、复命 |
 | `infrastructure.py` | 四.第四层 全局基础设施 | 混用：RetryConfig/SessionContinuationMode/policy/otel 直接用；任务状态机、TaskStore、任务级恢复、任务级鉴权、审计事件日志、指标计数器为占位 |
 | `acceptance.py` | 一.2 交付物验收 | 否：占位（stdlib 文件校验 + 结构化输出近似） |
 | `completion.py` | 五 完成判定规则 | 部分：ExecutionFinished 用 SDK StepStatus 近似，其余占位 |
