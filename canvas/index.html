@@ -25,6 +25,7 @@
   #topbar .histmode{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);white-space:nowrap;}
   #topbar .histmode select{background:var(--panel2);color:var(--txt);border:1px solid var(--line);border-radius:6px;padding:4px 6px;font-size:11px;}
   #goal{width:280px;}
+  #addTitle{width:170px;}
   #status{font-size:11px;color:var(--muted);}
 
   #stage{position:absolute;top:53px;left:0;right:0;bottom:0;overflow:hidden;background:
@@ -205,6 +206,7 @@
     <button id="newBtn">🆕 新建</button>
     <input id="goal" placeholder="输入目标，例如：做一个天气查询机器人" />
     <button class="primary" id="genBtn">⚡ 生成 idea 蛋</button>
+    <input id="addTitle" placeholder="新蛋名称（回车创建）" />
     <button id="addBtn">＋ 手动加蛋</button>
     <button id="combineBtn">🧩 组合选中蛋</button>
     <button id="runBtn" class="primary">▶ 一键运行选中蛋</button>
@@ -600,8 +602,8 @@ function createEggEl(e){
   const egg={id:e.id,title:e.title,prompt:e.prompt,type:e.type,x:e.x,y:e.y,parent:e.parent||null,el,selected:false,messages:[]};
   state.eggs[e.id]=egg;
 
-  el.querySelector('.title').addEventListener('input', ev=> egg.title=ev.target.value);
-  el.querySelector('.prompt').addEventListener('input', ev=> egg.prompt=ev.target.value);
+  el.querySelector('.title').addEventListener('input', ev=>{ egg.title=ev.target.value; scheduleEggUpdate(egg); });
+  el.querySelector('.prompt').addEventListener('input', ev=>{ egg.prompt=ev.target.value; scheduleEggUpdate(egg); });
   el.querySelector('.chk').addEventListener('change', ev=>{ egg.selected=ev.target.checked; el.classList.toggle('sel', egg.selected); });
   el.querySelector('.x').addEventListener('click', ()=> send({type:'deleteEgg', id:egg.id}));
 
@@ -682,10 +684,15 @@ function syncGraph(eggs, edges){
   for(const e of eggs){
     const ex=state.eggs[e.id];
     if(ex){
-      ex.title=e.title; ex.prompt=e.prompt; ex.type=e.type; ex.x=e.x; ex.y=e.y; ex.parent=e.parent||null;
+      // Skip title/prompt fields the user is actively editing: the debounced
+      // updateEgg may not have landed yet, and re-applying the server's stale
+      // value here would erase the in-progress edit (and the next debounce
+      // would then send that stale value back).
+      const tEl=ex.el.querySelector('.title'), pEl=ex.el.querySelector('.prompt');
+      if(document.activeElement!==tEl){ ex.title=e.title; tEl.value=e.title; }
+      if(document.activeElement!==pEl){ ex.prompt=e.prompt; pEl.value=e.prompt; }
+      ex.type=e.type; ex.x=e.x; ex.y=e.y; ex.parent=e.parent||null;
       ex.el.style.left=e.x+'px'; ex.el.style.top=e.y+'px';
-      ex.el.querySelector('.title').value=e.title;
-      ex.el.querySelector('.prompt').value=e.prompt;
       ex.el.querySelector('.badge').textContent=e.type;
       // Re-sync run state from the backend: a stale "运行中" left behind by a
       // dropped WS stream is cleared here because the backend's egg.busy is the
@@ -811,6 +818,17 @@ async function refreshEggPanel(eggId){
   }catch(e){}
 }
 
+/* Persist title/prompt edits to the backend (debounced) so they survive the
+   next 'eggs' sync. Without this, any add/run/generate/move event re-applies
+   server state and wipes what the user typed into the egg's textarea/input. */
+const eggUpdateTimers={};
+function scheduleEggUpdate(egg){
+  clearTimeout(eggUpdateTimers[egg.id]);
+  eggUpdateTimers[egg.id]=setTimeout(()=>{
+    send({type:'updateEgg', id:egg.id, title:egg.title, prompt:egg.prompt});
+  }, 350);
+}
+
 function sendCommand(egg, text){
   pushMsg(egg,'user',text);
   egg.el.querySelector('.cmd').value='';
@@ -926,7 +944,16 @@ $('#genBtn').addEventListener('click', ()=>{
   btn.disabled=true;
   send({type:'generate', goal:g});
 });
-$('#addBtn').addEventListener('click', ()=> send({type:'addEgg', title:'新蛋'}));
+$('#addBtn').addEventListener('click', ()=>{
+  // A name makes each egg distinguishable; default to a numbered "蛋 N" so
+  // repeated clicks without a name still don't collide.
+  const raw=($('#addTitle').value||'').trim();
+  const title=raw || '蛋 '+(Object.keys(state.eggs).length+1);
+  $('#addTitle').value='';
+  $('#addTitle').focus();
+  send({type:'addEgg', title});
+});
+$('#addTitle').addEventListener('keydown', ev=>{ if(ev.key==='Enter'){ ev.preventDefault(); $('#addBtn').click(); } });
 $('#combineBtn').addEventListener('click', ()=>{
   const ids=Object.values(state.eggs).filter(e=>e.selected).map(e=>e.id);
   if(!ids.length){ toast('请先勾选要组合的蛋'); return; }

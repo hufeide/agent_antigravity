@@ -52,7 +52,7 @@ class ContextEntry:
             text=data.get("text", ""),
             version=int(data.get("version", 1)),
             source=data.get("source", ""),
-            updated_at=float(data.get("updated_at", time.time())),
+            updated_at=float(data.get("updated_at") or time.time()),
             ttl=data.get("ttl"),
         )
 
@@ -99,15 +99,17 @@ class ContextStore:
 
     # -- reads --------------------------------------------------------------
     def get(self, task_id: str) -> ContextEntry | None:
-        entry = self._entries.get(task_id)
-        if entry is not None and entry.expired():
-            self.drop(task_id)
-            return None
-        return entry
+        with self._lock:
+            entry = self._entries.get(task_id)
+            if entry is not None and entry.expired():
+                self._entries.pop(task_id, None)
+                return None
+            return entry
 
     def all(self) -> list[ContextEntry]:
         self.prune()
-        return list(self._entries.values())
+        with self._lock:
+            return list(self._entries.values())
 
     def snapshot(
         self,
@@ -142,14 +144,16 @@ class ContextStore:
 
     # -- persistence --------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
-        return {k: v.to_dict() for k, v in self._entries.items()}
+        with self._lock:
+            return {k: v.to_dict() for k, v in self._entries.items()}
 
     def load_dict(self, data: dict[str, Any]) -> int:
-        for key, payload in (data or {}).items():
-            entry = ContextEntry.from_dict({**payload, "task_id": key})
-            if not entry.expired():
-                self._entries[key] = entry
-        return len(self._entries)
+        with self._lock:
+            for key, payload in (data or {}).items():
+                entry = ContextEntry.from_dict({**payload, "task_id": key})
+                if not entry.expired():
+                    self._entries[key] = entry
+            return len(self._entries)
 
     def clear(self) -> None:
         with self._lock:

@@ -21,10 +21,20 @@ from pathlib import Path
 
 from .config import (WORKTREE_ROOT, BACKEND, quiet_sdk_start,
                      backend_options, is_corrupt_conversation_error,
-                     is_stream_stall_error, is_upstream_stream_error)
+                     is_stream_stall_error)
 from .reasoning import (set_reasoning_capture, reasoning_capture_state,
                         thought_text)
-from .. import acceptance, agent_runtime, completion, infrastructure, messaging, models
+try:  # pragma: no cover - demo framework may be absent in trimmed installs
+    from .. import (acceptance, agent_runtime, completion, infrastructure,
+                    messaging, models)
+    FRAMEWORK_OK = True
+    _FW_ERR = None
+except Exception as _fw_err:  # pragma: no cover
+    FRAMEWORK_OK = False
+    _FW_ERR = _fw_err
+    acceptance = agent_runtime = completion = None  # type: ignore[assignment]
+    infrastructure = messaging = models = None  # type: ignore[assignment]
+    print(f"[canvas] demo framework unavailable: {_fw_err}")
 
 try:  # pragma: no cover - depends on installed SDK
     from google.antigravity import Agent, CapabilitiesConfig, types
@@ -98,6 +108,47 @@ class _LLMBox:
 
 _LLM_BOX = _LLMBox()
 
+try:  # asyncio.timeout is Python 3.11+
+    _turn_timeout = asyncio.timeout
+except AttributeError:  # Python 3.10 backport
+
+    class _TurnTimeout:
+        """asyncio.timeout() backport for Python 3.10.
+
+        Cancels the current task when the deadline expires, then surfaces the
+        internal cancellation as asyncio.TimeoutError (the same contract
+        asyncio.timeout follows) so callers' exception handling stays uniform.
+        """
+
+        def __init__(self, seconds: float):
+            self._seconds = seconds
+            self._task = None
+            self._timer = None
+            self._fired = False
+
+        async def __aenter__(self):
+            self._task = asyncio.current_task()
+            self._timer = asyncio.get_running_loop().call_later(
+                self._seconds, self._fire)
+            return self
+
+        def _fire(self):
+            self._fired = True
+            task = self._task
+            if task is not None and not task.done():
+                task.cancel()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            if exc_type is asyncio.CancelledError and self._fired:
+                raise asyncio.TimeoutError(
+                    f"turn timed out after {self._seconds:g}s")
+            return False
+
+    _turn_timeout = _TurnTimeout
+
 
 def _env_int(name, default=None):
     """Read an optional integer environment variable."""
@@ -107,7 +158,18 @@ def _env_int(name, default=None):
     try:
         return int(raw)
     except ValueError:
-        return None
+        return default
+
+
+def _env_float(name, default=None):
+    """Read an optional float environment variable."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 async def _aclose_quiet(cm):
@@ -122,13 +184,13 @@ async def _aclose_quiet(cm):
 # never ends) doesn't finish, abandon it so the box lock is released and the egg
 # returns to 空闲 instead of being stuck 运行中 forever. Generous by default;
 # override with EGG_TURN_TIMEOUT (seconds).
-_TURN_TIMEOUT = float(os.environ.get("EGG_TURN_TIMEOUT", "300"))
+_TURN_TIMEOUT = _env_float("EGG_TURN_TIMEOUT", 300.0)
 
 # A turn that goes SILENT (no chunk at all for this long) is stalled — the
 # model/server stopped streaming. Without this watchdog the egg would keep the
 # "运行中" badge for the whole _TURN_TIMEOUT and the panel/trace would look
 # frozen. Abort the turn instead so the egg returns to 空闲 promptly.
-_STALL_TIMEOUT = float(os.environ.get("EGG_STALL_TIMEOUT", "120"))
+_STALL_TIMEOUT = _env_float("EGG_STALL_TIMEOUT", 120.0)
 
 # The blind silence watchdog above cannot distinguish "the server is doing a
 # LONG prefill (llama.cpp/LM Studio stream nothing while processing the prompt,
@@ -140,9 +202,9 @@ _STALL_TIMEOUT = float(os.environ.get("EGG_STALL_TIMEOUT", "120"))
 #   - zombie       : processing but progress frozen    -> abort immediately
 #   - server_down  : unreachable during the silence    -> abort immediately
 #   - timeout      : no /slots data at all             -> old blind behaviour
-_STALL_PROBE_INTERVAL = float(os.environ.get("EGG_STALL_PROBE_INTERVAL", "15"))
-_ZOMBIE_TIMEOUT = float(os.environ.get("EGG_ZOMBIE_TIMEOUT", "90"))
-_STALL_EXTENSIONS = int(os.environ.get("EGG_STALL_EXTENSIONS", "2"))
+_STALL_PROBE_INTERVAL = _env_float("EGG_STALL_PROBE_INTERVAL", 15.0)
+_ZOMBIE_TIMEOUT = _env_float("EGG_ZOMBIE_TIMEOUT", 90.0)
+_STALL_EXTENSIONS = _env_int("EGG_STALL_EXTENSIONS", 2)
 
 
 class _StallDiagnosis(RuntimeError):
@@ -168,6 +230,9 @@ __all__ = ["set_reasoning_capture", "reasoning_capture_state"]
 
 def _chunk_to_text(chunk):
     """Convert an SDK response chunk into display text."""
+    if not SDK_OK:
+        # Without the SDK there are no typed chunks to interpret.
+        return ""
     if isinstance(chunk, str):
         return chunk
     if isinstance(chunk, types.Text):
@@ -263,11 +328,16 @@ class EggAgent:
         # NB: use explicit None checks -- TaskStore defines __len__, so an empty
         # store is falsy and 'store or TaskStore()' would silently replace the
         # shared store with a private one.
-        self._bus = bus if bus is not None else messaging.MessageBus()
-        self._store = store if store is not None else infrastructure.TaskStore()
-        self._state = state if state is not None else infrastructure.StateManager()
-        self._metrics = metrics if metrics is not None else infrastructure.Metrics()
-        self._audit = audit if audit is not None else infrastructure.AuditLog()
+        if not FRAMEWORK_OK:
+            # Framework unavailable: eggs still chat but have no shared store/bus.
+            self._bus = self._store = self._state = None
+            self._metrics = self._audit = None
+        else:
+            self._bus = bus if bus is not None else messaging.MessageBus()
+            self._store = store if store is not None else infrastructure.TaskStore()
+            self._state = state if state is not None else infrastructure.StateManager()
+            self._metrics = metrics if metrics is not None else infrastructure.Metrics()
+            self._audit = audit if audit is not None else infrastructure.AuditLog()
         self._context = context
         # Global model-call trace sink (demo/canvas/trace.py). When set, every
         # transcript record is mirrored into the canvas-wide chronological
@@ -379,6 +449,11 @@ Rules:
 5. **Write a completion summary:** Before finishing, write your completion summary to `COMPLETION_SUMMARY.md` in your workspace root (never in `agent_data/`). It must cover: (1) what you did; (2) key deliverables and file paths; (3) verification results; (4) decisions you made; (5) caveats or limitations. Your final reply must also state the result and summarize this summary, so the commander and downstream eggs can read it.
 6. Coordinate with connected eggs only when instructed.
 7. Be concise and truthful.
+8. **Do NOT declare artifacts in the finish tool.** The system collects your
+   deliverable files automatically from the workspace root. Passing artifact
+   metadata in `finish` with paths outside `agent_data/brain/` is rejected by
+   the SDK and causes the entire turn to fail. Just write your files and call
+   `finish` with your text summary only.
 """
         )
         # Only keep the minimal SWE toolset (write/run code) — drop the default
@@ -588,6 +663,9 @@ Rules:
 
     async def _open_agent(self, resume=True):
         """Build + enter an Agent, cleaning up if entering fails."""
+        if not FRAMEWORK_OK:
+            raise RuntimeError(
+                f"demo framework unavailable: {_FW_ERR}")
         with quiet_sdk_start():
             cm = Agent(self._config(resume=resume))
             try:
@@ -964,7 +1042,9 @@ Rules:
         # it is reset once per RUN in run(). A retry must not dodge the artifact
         # requirement by quietly skipping the file tools it failed with on a
         # previous attempt.
-        self._last_instruction = ""
+        # NB: _last_instruction is NOT reset here either — run() sets it to the
+        # current instruction and _record_task_run reads it after this chat
+        # returns (it must still see the instruction that produced these chunks).
         # Per-run guard against a model that repeats the same tool call forever
         # (observed with small local models: 10+ identical create_file retries).
         self._last_tc_sig = None
@@ -1090,6 +1170,9 @@ Rules:
                 cid = getattr(self._agent, "conversation_id", None)
                 self.conversation_id = cid or uuid.uuid4().hex
                 self._start_state = "ready"
+                # The reopened agent was built from the CURRENT read_dirs, so
+                # sync the snapshot used to detect later read_dir changes.
+                self._started_read_dirs = list(self.read_dirs)
             else:
                 self.conversation_id = uuid.uuid4().hex
                 self._start_state = "failed"
@@ -1380,7 +1463,7 @@ Rules:
                         # trickling chunks past _TURN_TIMEOUT must still be abandoned so
                         # the egg never sits 运行中 forever — this arms the advertised
                         # _TURN_TIMEOUT (which was previously dead code).
-                        async with asyncio.timeout(_TURN_TIMEOUT):
+                        async with _turn_timeout(_TURN_TIMEOUT):
                             try:
                                 # Stream with a STALL watchdog: if no chunk arrives
                                 # for _STALL_TIMEOUT the model/server may have gone
@@ -1497,7 +1580,7 @@ Rules:
                                 self._trace.append(self.id, self.title, "user",
                                                    "prompt", text=_NUDGE_PROMPT)
                             try:
-                                async with asyncio.timeout(_TURN_TIMEOUT):
+                                async with _turn_timeout(_TURN_TIMEOUT):
                                     async for tok in self._chat_once(_NUDGE_PROMPT):
                                         yield tok
                             except asyncio.TimeoutError:
@@ -1647,6 +1730,11 @@ Rules:
         recorded (link.md 一.6), and the outcome is published on the message
         bus as REPORT plus DELIVER / BLOCKED / CANCEL (link.md 一.4).
         """
+        if not FRAMEWORK_OK:
+            # Framework modules are unavailable: the egg still chats, but there
+            # is nothing to mirror into.
+            return
+
         status = models.ExecutionStatus.FINISHED
         task_status = models.TaskStatus.SUCCESS
         report_status = "done"
@@ -1671,10 +1759,15 @@ Rules:
         # panel calls egg.run() without going through the orchestrator's
         # dispatch, which is the only path that otherwise re-merges runs back).
         previous = self._store.load(self.id) if self._store is not None else None
+        # Keep the previous run's metadata (ran_and_reported, attempt,
+        # blocked_reason, artifact_versions, ...) so a direct UI command does
+        # not erase progress the orchestrator recorded.
+        task_meta = dict(previous.metadata) if previous is not None else {}
+        task_meta["worktree"] = str(self.worktree)
         task = models.Task(
             task_id=self.id, title=self.title, description=self.prompt,
             owner_agent_id=self.id, status=models.TaskStatus.PLANNED,
-            metadata={"worktree": str(self.worktree)})
+            metadata=task_meta)
         if previous is not None:
             # Preserve the commander's confirmation across direct commands.
             task.confirmed = previous.confirmed
@@ -1775,10 +1868,17 @@ Rules:
             # already-run eggs on a re-run of the DAG. Cleared by _reset_task.
             if task.report_submitted:
                 task.metadata["ran_and_reported"] = True
-            if not task.report_submitted and "blocked_reason" not in task.metadata:
-                task.metadata["blocked_reason"] = (
-                    task.acceptance.evidence[-1]
-                    if task.acceptance.evidence else "acceptance not passed")
+                # A stale reason from an earlier failed run must not survive a
+                # successful report.
+                task.metadata.pop("blocked_reason", None)
+            else:
+                # The report did not pass this run: the marker (copied from the
+                # previous task) must not claim "已运行并上报" any more.
+                task.metadata.pop("ran_and_reported", None)
+                if "blocked_reason" not in task.metadata:
+                    task.metadata["blocked_reason"] = (
+                        task.acceptance.evidence[-1]
+                        if task.acceptance.evidence else "acceptance not passed")
 
             report = completion.evaluate_task_completed(task)
             self.last_task = task
@@ -1857,7 +1957,10 @@ Rules:
                         resp = await self._agent.chat(prompt)
                         self._active_resp = resp
                         try:
-                            summary = await resp.text()
+                            # A hung compress() stream would keep the egg's
+                            # busy lock forever; cap the wait like a turn.
+                            summary = await asyncio.wait_for(
+                                resp.text(), timeout=_TURN_TIMEOUT)
                         finally:
                             self._active_resp = None
                         if self._trace is not None:

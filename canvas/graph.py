@@ -830,6 +830,34 @@ Rules:
             egg.x, egg.y = x, y
             self.save()
 
+    async def update_egg(self, eid, title=None, prompt=None):
+        """Update an egg's title/prompt (rename / edit prompt) and persist.
+
+        The stored task keeps a snapshot title/description from its last run;
+        a rename after the run updates both the egg and the task so the
+        commander's completion summary shows the current name.
+        """
+        egg = self.eggs.get(eid)
+        if egg is None:
+            return None
+        if title is not None:
+            egg.title = title
+        if prompt is not None:
+            egg.prompt = prompt
+        if FRAMEWORK_OK and self._store is not None:
+            try:
+                task = self._store.load(eid)
+                if task is not None:
+                    if title is not None:
+                        task.title = title
+                    if prompt is not None:
+                        task.description = prompt
+                    self._store.save(task)
+            except Exception:
+                pass
+        self.save()
+        return egg
+
     async def combine(self, ids):
         srcs = [self.eggs[i] for i in ids if i in self.eggs]
         if not srcs:

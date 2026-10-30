@@ -5,7 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from .graph import Canvas
@@ -386,6 +386,19 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
         await canvas.add_egg(msg.get("title", "新蛋"), msg.get("prompt", ""))
         await ws.send_json({"type": "eggs", **canvas.view()})
 
+    elif t == "updateEgg":
+        # Rename / edit an egg's prompt. Persisted immediately so the next
+        # 'eggs' sync never wipes what the user typed. An empty title is
+        # ignored (a cleared name field must not blank the egg's title).
+        eid = msg.get("id") or msg.get("eggId")
+        if eid:
+            title = msg.get("title")
+            if title is not None and not str(title).strip():
+                title = None
+            await canvas.update_egg(eid, title=title,
+                                    prompt=msg.get("prompt"))
+            await ws.send_json({"type": "eggs", **canvas.view()})
+
     elif t == "command":
         eid = msg.get("eggId")
         egg = canvas.eggs.get(eid)
@@ -405,6 +418,12 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                 try:
                     await ws.send_json({"type": "system", "eggId": eid,
                                         "text": "⏹ 已打断运行。"})
+                except Exception:  # pragma: no cover
+                    pass
+            except Exception as ex:  # run() raised: report and reset UI state
+                try:
+                    await ws.send_json({"type": "error", "eggId": eid,
+                                        "message": f"运行失败：{ex}"})
                 except Exception:  # pragma: no cover
                     pass
             finally:
@@ -467,7 +486,9 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                 # resumes the LLM session via the saved conversation_id) and
                 # replay the SDK step history into the transcript, then push
                 # the rebuilt transcript to the UI.
-                asyncio.create_task(_hydrate_egg_transcripts(canvas, ws))
+                task = asyncio.create_task(_hydrate_egg_transcripts(canvas, ws))
+                TASKS.add(task)
+                task.add_done_callback(TASKS.discard)
             except Exception as ex:
                 await ws.send_json({"type": "error", "message": f"load failed: {ex}"})
                 # Clear the canvas so the frontend doesn't show stale eggs from
@@ -624,7 +645,13 @@ async def ws_endpoint(websocket: WebSocket):
     canvas: Canvas = app.state.canvas
     try:
         while True:
-            msg = await websocket.receive_json()
+            try:
+                msg = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+            except Exception as ex:  # malformed frame: keep the socket alive
+                logger.debug("[ws] bad frame: %s", ex)
+                continue
             try:
                 await _dispatch(msg, websocket, canvas)
             except Exception as ex:  # keep the socket alive on per-message errors
