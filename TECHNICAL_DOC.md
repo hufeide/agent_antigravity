@@ -691,7 +691,7 @@ python -m demo.a2a_graph --query "帮我用 Python 写一个快速排序"
 
 **交互**：
 
-- `run(text, context)`：流式执行命令。含**整轮安全超时** `_TURN_TIMEOUT`（默认 300s，`EGG_TURN_TIMEOUT`）+ **静默看门狗** `_STALL_TIMEOUT`（默认 120s，`EGG_STALL_TIMEOUT`，无 chunk 即视为停滞）。
+- `run(text, context)`：流式执行命令。含**整轮安全超时** `_TURN_TIMEOUT`（默认 300s，`EGG_TURN_TIMEOUT`）+ **静默看门狗** `_STALL_TIMEOUT`（默认 120s，`EGG_STALL_TIMEOUT`）。看门狗是**服务端感知**的：静默期间并发轮询模型服务器 `/slots`，按服务端真实状态分类处置——`slow_prefill`（处理中且进度推进）延长等待（最多 `EGG_STALL_EXTENSIONS` 次）；`dead_stream`（服务端已空闲但无 chunk）/`zombie`（处理中但进度冻结 `EGG_ZOMBIE_TIMEOUT`）/`server_down`（不可达）立即中止；无 `/slots` 的服务器回退到纯静默超时。中止时还会尝试 `POST /abort` 释放服务端僵尸槽位。
 - **重复工具调用循环防护**：同一签名工具调用 ≥4 次触发 `_loop_guard`，中止本轮。
 - **空回合治愈**：既无文本又无结构化工具调用的回合会被 SDK 持久化为空 assistant 消息，导致后续请求被 HTTP 400 拒绝；检测后调用 `_heal_conversation` 丢弃会话重建。
 - **补写提示**（write nudge）：文件任务只回文本未建文件时，要求同一会话补写交付物。
@@ -726,7 +726,8 @@ python -m demo.a2a_graph --query "帮我用 Python 写一个快速排序"
 
 - `upstream_of(eid)`：所有祖先蛋（传递，容忍环）。
 - `neighbor_context(eid)`：版本化共享上下文。DAG 中蛋**只看到上游邻居**（避免泄漏下游不存在的结果）；无边蛋保持自由共享。优先 ContextStore 快照，回退原始历史。
-- `_share_upstream(egg)`：把上游交付物复制到 `<worktree>/shared/<上游 slug>/`，设为**只读**（输入而非草稿，下游蛋不能「修正」上游副本而静默丢失变更）。
+- `_peer_dirs(egg)`：本蛋**可读**的上游 + 平行节点工作目录（下游后代除外，避免泄漏尚未生成的结果）。
+- `_peer_note(peers)`：把上述目录以**只读引用**的形式自动补进提示词，替代旧的 `shared/` 拷贝；上游证据已就绪，平行节点证据可能尚未生成。
 
 **消息总线策略**：
 
@@ -737,7 +738,7 @@ python -m demo.a2a_graph --query "帮我用 Python 写一个快速排序"
 
 - 用 `asyncio.Queue` 解耦 orchestrator 并发分发与单个 async generator，使 WebSocket 面板收到所有运行蛋的交错事件。
 - `_build_orchestrator(ids, reset)`：构建带依赖边的 Orchestrator。
-- `dispatch(task)`：权限检查 → 发布 `TASK_ASSIGN` → 共享上游交付物 → 运行蛋 → 同步回 task（状态/交付物/验收/复命/运行）→ 失败时让 orchestrator 应用重试策略。
+- `dispatch(task)`：权限检查 → 发布 `TASK_ASSIGN` → 挂载上游/平行节点目录（`egg.set_read_dirs` + `_peer_note`，只读）→ 运行蛋 → 同步回 task（状态/交付物/验收/复命/运行）→ 失败时让 orchestrator 应用重试策略。
 - runner：`orch.arun(dispatch)`；取消时 `orch.cancel_all("interrupted")`。
 - **全局收敛**：`completion.global_report`；`confirmed`（总指挥确认）；审批过期；输出收敛文本 + completion 事件 + 审计。
 
@@ -907,8 +908,26 @@ IDEA_BACKEND=litert GEMMA4_MODEL_PATH=~/.litert-lm/models/gemma4-26b/model.liter
 | `CANVAS_PLAN_TIMEOUT` | 60 | 规划超时 |
 | `EGG_TURN_TIMEOUT` | 300 | 单回合安全超时 |
 | `EGG_STALL_TIMEOUT` | 120 | 静默看门狗 |
+| `EGG_STALL_PROBE_INTERVAL` | 15 | `/slots` 进度采样间隔（秒） |
+| `EGG_ZOMBIE_TIMEOUT` | 90 | 处理中但进度冻结超过此值判为僵尸请求 |
+| `EGG_STALL_EXTENSIONS` | 2 | slow_prefill 时静默看门狗的最大延长次数 |
 | `EGG_COMMAND_TIMEOUT` | 600 | cloud 命令超时 |
 | `EGG_MAX_TOTAL_TOKENS` / `EGG_MAX_TOOL_CALLS` / `EGG_MAX_MODEL_CALLS` | None | 资源上限（opt-in） |
+
+### 接入讯飞星火 MaaS（OpenAI 兼容）
+
+SDK 的 OpenAI 后端（`LocalOpenAIAgentConfig` / proto `GemmaEndpoint`）只接受 `base_url`，**没有 api_key 字段**，harness 也不会为 OpenAI 后端读取鉴权环境变量，因此无法直接给 MaaS 这类需要 `Authorization: Bearer` 的服务加鉴权头。解决：`demo/maas_proxy.py` 本地代理。
+
+```bash
+# 1. 启动代理（注入 Bearer 鉴权、固定模型名、透传 SSE 流）
+MAAS_API_KEY="ak-..." MAAS_MODEL="spark-x2.6" python3 demo/maas_proxy.py
+#   默认监听 127.0.0.1:9000，转发 https://maas-api.cn-huabei-1.xf-yun.com/v2/chat/completions
+
+# 2. demo 侧零改动，仅需环境变量
+IDEA_BACKEND=openai OPENAI_BASE_URL=http://localhost:9000/v1 OPENAI_MODEL=spark-x2.6 python3 demo/server.py
+```
+
+代理端点：`POST /v1/chat/completions`（鉴权转发+流式透传）、`GET /v1/models`（SDK 模型自动探测）、`GET /slots`（模拟在途请求进度，配合 egg 的服务端感知看门狗）、`GET /health`。上游 400 时自动剥离 `stream_options` 重试一次；客户端中途断开（看门狗中止/用户停止）优雅退出不报错。
 
 ---
 

@@ -19,11 +19,14 @@ import json
 import os
 import inspect
 import re
-import shutil
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
-from .config import SESSIONS_DIR, WORKSPACE, BACKEND, build_agent_config
+from .config import (SESSIONS_DIR, WORKSPACE, BACKEND, build_agent_config,
+                     backend_options)
+from .trace import GlobalTrace
 from .context import ContextStore
 from .egg import EggAgent, SDK_OK
 
@@ -104,14 +107,18 @@ COMMANDER_DECISION_SCHEMA = {
 
 
 def _extract_json(text):
-    """Parse the first JSON object out of a model reply.
+    """Parse the first JSON object or array out of a model reply.
 
-    Local models routinely wrap JSON in ``` fences or add a sentence before
-    it, so plain json.loads() is too strict for planning.
+    Local models routinely wrap JSON in ``` fences or add a sentence
+    before it, so plain json.loads() is too strict for planning.
     """
     raw = (text or "").strip()
+    # Strip BOM / zero-width characters some models emit
+    raw = raw.lstrip("\ufeff​‌‍")
     if raw.startswith("```"):
+        # Remove opening fence line (```json, ```, etc.)
         raw = raw.split("\n", 1)[-1] if "\n" in raw else raw
+        # Remove closing fence
         raw = raw.rsplit("```", 1)[0]
     try:
         return json.loads(raw)
@@ -119,13 +126,13 @@ def _extract_json(text):
         pass
     decoder = json.JSONDecoder()
     for idx, ch in enumerate(raw):
-        if ch != "{":
+        if ch not in "{[":
             continue
         try:
             obj, _ = decoder.raw_decode(raw[idx:])
         except ValueError:
             continue
-        if isinstance(obj, dict):
+        if isinstance(obj, (dict, list)):
             return obj
     raise ValueError(f"planner reply is not JSON: {raw[:200]!r}")
 
@@ -253,6 +260,101 @@ def _normalize_plan_items(items, available_titles=None, max_tasks=5, min_tasks=1
                     [(dep, title) for title, _, deps in result for dep in deps])
     return result
 
+
+def _node_depths(nodes, edges):
+    """Longest-path depth (distance from a root) for each node in a DAG.
+
+    Roots (no incoming edges) have depth 0. Returns {node: depth}; isolated or
+    unreachable nodes get 0. Assumes an acyclic graph (callers validate first).
+    """
+    node_set = set(nodes)
+    adjacency = {n: [] for n in node_set}
+    indegree = {n: 0 for n in node_set}
+    for source, target in edges:
+        if source in node_set and target in node_set and source != target:
+            adjacency[source].append(target)
+            indegree[target] += 1
+    ready = [n for n in nodes if indegree[n] == 0]
+    order = []
+    ind = dict(indegree)
+    while ready:
+        node = ready.pop(0)
+        order.append(node)
+        for child in adjacency[node]:
+            ind[child] -= 1
+            if ind[child] == 0:
+                ready.append(child)
+    depth = {n: 0 for n in node_set}
+    for node in order:
+        d = depth[node] + 1
+        for child in adjacency[node]:
+            if depth[child] < d:
+                depth[child] = d
+    return depth
+
+
+def _prune_plan_unique(plan):
+    """Keep a unique path to every task (in-degree <= 1) at the title level.
+
+    A node reachable by two paths (e.g. A->C and A->B->C) breaks the rule, so
+    each task keeps only its DEEPEST prerequisite — this preserves the longest
+    chain and does not orphan intermediate tasks. Returns
+    (pruned_plan, dropped) where dropped lists (task, removed_dep) pairs.
+    """
+    titles = [title for title, _prompt, _deps in plan]
+    edges = [(dep, title) for title, _prompt, deps in plan for dep in deps]
+    depth = _node_depths(titles, edges)
+    pruned, dropped = [], []
+    for title, prompt, deps in plan:
+        if len(deps) > 1:
+            keep = max(deps, key=lambda dep: depth.get(dep, 0))
+            pruned.append((title, prompt, [keep]))
+            for dep in deps:
+                if dep != keep:
+                    dropped.append((title, dep))
+        else:
+            pruned.append((title, prompt, list(deps)))
+    return pruned, dropped
+
+
+def _enforce_unique_paths(nodes, edges, task_nodes):
+    """Keep a unique path to every task node (in-degree <= 1) at the id level.
+
+    For each node in task_nodes with more than one incoming edge, keep only the
+    edge from its DEEPEST parent and drop the rest; non-task nodes are left
+    untouched. Returns (kept_edges, dropped) where dropped lists (parent, task)
+    id pairs removed, for reporting.
+    """
+    task_set = set(task_nodes)
+    depth = _node_depths(list(nodes), edges)
+    parents = {t: [] for t in task_set}
+    kept = []
+    for source, target in edges:
+        if target in task_set:
+            parents[target].append(source)
+        else:
+            kept.append((source, target))
+    dropped = []
+    for target in task_nodes:
+        cand = parents[target]
+        if not cand:
+            continue
+        if len(cand) == 1:
+            kept.append((cand[0], target))
+            continue
+        best = cand[0]
+        best_depth = depth.get(best, 0)
+        for p in cand[1:]:
+            if depth.get(p, 0) > best_depth:
+                best = p
+                best_depth = depth.get(p, 0)
+        kept.append((best, target))
+        for p in cand:
+            if p != best:
+                dropped.append((p, target))
+    return kept, dropped
+
+
 def _env_float(name, default=None):
     raw = (os.environ.get(name) or "").strip()
     if not raw:
@@ -261,6 +363,66 @@ def _env_float(name, default=None):
         return float(raw)
     except ValueError:
         return default
+
+
+def _env_int(name, default=None):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _usage_text(response):
+    """One-line token usage summary for a ChatResponse (for trace records)."""
+    try:
+        u = response.usage_metadata
+        if u is None:
+            return "无用量信息"
+        return (f"prompt={getattr(u, 'prompt_token_count', 0)} "
+                f"cached={getattr(u, 'cached_content_token_count', 0)} "
+                f"candidates={getattr(u, 'candidates_token_count', 0)} "
+                f"thoughts={getattr(u, 'thoughts_token_count', 0)} "
+                f"total={getattr(u, 'total_token_count', 0)}")
+    except Exception:
+        return "?"
+
+
+def _server_root():
+    """llama.cpp/LM Studio native endpoints (/slots, /abort) live at the
+    SERVER ROOT, not under the OpenAI-compatible /v1 prefix that
+    base_url carries — request them with the /v1 suffix stripped."""
+    base = str(backend_options().get("base_url") or "").rstrip("/")
+    if not base:
+        return ""
+    p = urllib.parse.urlparse(base)
+    return f"{p.scheme}://{p.netloc}" if p.path else base
+
+
+def _abort_server_request():
+    """Best-effort: ask the model server to abort its in-flight request.
+
+    ``response.cancel()`` only stops the SDK-side reader; llama.cpp cannot
+    detect a client disconnect mid-prefill, so an aborted request keeps
+    burning its slot (a "zombie"). POST /abort (llama.cpp native; LM Studio
+    may answer 404) releases it server-side when the endpoint exists.
+    """
+    root = _server_root()
+    if not root:
+        return
+    for path in ("/abort", "/api/abort"):
+        try:
+            req = urllib.request.Request(
+                root + path, data=b"{}",
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=3) as r:
+                if r.status < 400:
+                    return
+        except Exception:
+            continue
+
 
 # --- demo framework (single-Agent SDK; see link.md section 六) --------------
 try:
@@ -335,6 +497,9 @@ class Canvas:
         self.eggs = {}
         self.edges = {}
         self.commander = Commander()
+        # 全局模型调用轨迹：蛋 + 总指挥 + 规划器的每一次模型对话都汇入这里，
+        # 前端「🌐 全局」标签按时间顺序流式展示（见 trace.py）。
+        self._trace = GlobalTrace()
         self.history_mode = "brief"
         self.session_id = None
         self.session_dir = None
@@ -375,6 +540,9 @@ class Canvas:
         self.session_id = ts
         self.session_dir = SESSIONS_DIR / ts
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        # 新会话目录对应新的全局轨迹文件（旧会话的轨迹留在旧目录）。
+        self._trace.set_path(self.session_dir / "global_trace.jsonl")
+        self._trace.load()
         return ts
 
     def _bind_session(self, sid, d, recover=True):
@@ -452,7 +620,7 @@ class Canvas:
         plan = []
         if goal and SDK_OK:
             try:
-                timeout = _env_float("CANVAS_PLAN_TIMEOUT", 60.0)
+                timeout = _env_float("CANVAS_PLAN_TIMEOUT", 240.0)
                 raw_plan = await asyncio.wait_for(self._plan_with_agent(goal), timeout=timeout)
                 plan = _normalize_plan_items(raw_plan)
             except Exception as exc:  # noqa: BLE001
@@ -468,13 +636,17 @@ class Canvas:
                 plan = [(title, f"{prompt}\n\n项目目标：{goal}", deps)
                         for title, prompt, deps in plan]
         plan = _normalize_plan_items(plan)
+        plan, dropped = _prune_plan_unique(plan)
+        if dropped:
+            detail = "; ".join(f"{task} 移除重复上游 {dep}"
+                               for task, dep in dropped)
+            print(f"[canvas] 依赖收敛为唯一路径：{detail}")
         created, by_title = [], {}
         for i, (title, prompt, _deps) in enumerate(plan):
             row, col = divmod(i, 3)
-            x = 120 + col * 380
-            y = 160 + row * 240
-            egg = await self.add_egg(title, prompt, x=x, y=y)
-            egg = await self.add_egg(title, prompt, x=120 + col * 380, y=160 + row * 240)
+            egg = await self.add_egg(
+                title, prompt,
+                x=120 + col * 380, y=160 + row * 240)
             created.append(egg)
             by_title[title] = egg
         for title, _prompt, deps in plan:
@@ -507,31 +679,110 @@ class Canvas:
         return created
 
     async def _plan_with_agent(self, goal):
-        """Ask a real SDK Agent for a validated JSON task plan."""
+        """Ask a real SDK Agent for a validated JSON task plan.
+
+        response_schema is a no-op on the local OpenAI backend: the harness
+        never receives it, so structured_output() always returns None and the
+        model's JSON must be parsed from the text stream. We drain the stream
+        once per attempt and try both the answer text and the reasoning
+        (thoughts) — reasoning models sometimes put the JSON only in
+        reasoning_content, leaving content empty.
+
+        If parsing fails, we retry in the SAME agent session with a
+        corrective prompt so the model sees its own mistake and can fix it.
+        """
         from google.antigravity import Agent, types
         config = build_agent_config(
             """You are the commander of a multi-agent project. Plan the work; do not execute it.
 Rules:
 1. Decompose the goal into 2–5 concrete tasks, each with a unique, non-empty title, clear prompt, and expected deliverable.
 2. Prefer parallel execution for independent tasks.
-3. `depends_on` lists all prerequisites that must successfully complete before the task starts; use [] if none.
+3. `depends_on` lists the prerequisites that must successfully complete before the task starts; use [] if none.
 4. Dependencies use exact task titles and contain no cycles.
-5. Review/summary tasks depend on every task whose output they need.
-6. Never assume planned outputs already exist.
-7. Return exactly one JSON object matching the schema, with no Markdown or extra text.""",
+5. Each task depends on AT MOST ONE other task: the whole plan must form a single linear chain (or a few independent chains), never a diamond. No task may be reachable from a root by two different paths (e.g. A->C and A->B->C are forbidden — pick one).
+6. When a task needs outputs from several upstream tasks, chain them in order (A->B->C) instead of making C depend on both A and B.
+7. Never assume planned outputs already exist.
+8. Return exactly one JSON object matching the schema, with no Markdown or extra text.""",
             response_schema=PLAN_SCHEMA, tools=(),
             capabilities=types.CapabilitiesConfig(
                 enabled_tools=types.BuiltinTools.none(), enable_subagents=False,
                 agent_behavior=types.AgentBehavior.MINIMAL))
+        max_retries = _env_int("CANVAS_PLAN_RETRIES", 2)
         async with Agent(config) as agent:
-            response = await agent.chat(f"Goal: {goal}") 
-            data = await response.structured_output()
-            if not isinstance(data, dict):
-                data = await response.text()
-                data = _extract_json(await response.text())
-            
-        if not isinstance(data, dict) or not isinstance(data.get("tasks"), list):
-            raise ValueError("planner response must contain a tasks list")
+            data = None
+            for attempt in range(max_retries + 1):
+                if attempt == 0:
+                    prompt = f"Goal: {goal}"
+                else:
+                    prompt = (
+                        f"Your previous reply could not be parsed as JSON. "
+                        f"Reply with EXACTLY one JSON object matching the "
+                        f"schema — no Markdown fences, no explanation, no "
+                        f"extra text.\nGoal: {goal}")
+                response = await agent.chat(prompt)
+                if self._trace is not None:
+                    # 全局轨迹：规划器每次尝试的模型输入。
+                    self._trace.append("planner", "规划器", "user",
+                                       "planner_prompt", text=prompt)
+                # resolve() drains the stream until the server sends a terminal
+                # step; a zombie prefill / dead connection never ends it, so
+                # bound the wait. Run it as a shielded task so a timeout can
+                # still send response.cancel() (halt_request) while the
+                # stream is live, then free the server slot via /abort (the
+                # same watchdog egg.py uses).
+                resolve_task = asyncio.ensure_future(response.resolve())
+                try:
+                    raw_chunks = await asyncio.wait_for(
+                        asyncio.shield(resolve_task),
+                        timeout=_env_float("CANVAS_PLAN_RESOLVE_TIMEOUT", 210.0))
+                except asyncio.TimeoutError:
+                    try:
+                        await response.cancel()
+                    except Exception:
+                        pass
+                    _abort_server_request()
+                    resolve_task.cancel()
+                    raise
+                texts = "".join(
+                    c.text for c in raw_chunks
+                    if isinstance(c, types.Text))
+                thoughts = "".join(
+                    c.text for c in raw_chunks
+                    if isinstance(c, types.Thought))
+                # 诊断日志：打印 chunk 类型分布与 text/thoughts 长度
+                from collections import Counter
+                type_counts = Counter(type(c).__name__ for c in raw_chunks)
+                print(f"[canvas] planner attempt {attempt + 1}: "
+                      f"chunks={dict(type_counts)}, "
+                      f"text_len={len(texts)}, thoughts_len={len(thoughts)}, "
+                      f"stop_reason={response.stop_reason}")
+                if self._trace is not None and (texts or thoughts):
+                    self._trace.append("planner", "规划器", "assistant",
+                                       "planner_reply", text=texts or thoughts)
+                parsed = None
+                for candidate in (texts, thoughts):
+                    if candidate.strip():
+                        try:
+                            parsed = _extract_json(candidate)
+                            break
+                        except ValueError:
+                            continue
+                if isinstance(parsed, dict) and isinstance(parsed.get("tasks"), list):
+                    data = parsed
+                    break
+                # 记录最后一次失败的回复，便于排查
+                last_reply = texts or thoughts
+                if attempt < max_retries:
+                    print(f"[canvas] planner attempt {attempt + 1}: "
+                          f"no valid JSON (got {len(last_reply)} chars); "
+                          f"retrying with corrective prompt")
+            if data is None:
+                raise ValueError(
+                    f"planner produced no valid JSON after {max_retries + 1} "
+                    f"attempts (last reply: {last_reply[:200]!r})")
+            if self._trace is not None:
+                self._trace.append("planner", "规划器", "system", "turn_end",
+                                   text=f"stop_reason={response.stop_reason} usage={_usage_text(response)}")
         return _normalize_plan_items(data["tasks"], min_tasks=2)
 
     async def add_egg(self, title, prompt, x=None, y=None):
@@ -547,6 +798,7 @@ Rules:
             session_dir=str(self.session_dir),
             bus=self._bus, store=self._store, state=self._state,
             metrics=self._metrics, audit=self._audit, context=self._context,
+            trace=self._trace,
         )
         self.eggs[eid] = egg
         self.save()
@@ -679,74 +931,58 @@ Rules:
                 parts.append(f"【蛋 {egg.title}】\n{txt}")
         return "\n\n".join(parts)
 
-    def _share_upstream(self, egg):
-        """Copy the upstream eggs' deliverables into <worktree>/shared/.
-
-        Eggs are isolated worktrees (link.md 一.6), so a downstream egg cannot
-        read the files an upstream egg produced — a reviewer would literally
-        have nothing to review. Before a run starts, copy the upstream tasks'
-        recorded artifacts (their real deliverables, not caches or agent data)
-        into a per-upstream subdirectory the egg is allowed to read.
-        """
-        ups = [u for u in self.upstream_of(egg.id) if u in self.eggs]
-        if not ups or self._store is None:
-            return []
-        dest_root = Path(egg.worktree) / "shared"
-        if dest_root.exists():
-            try:
-                dest_root.chmod(0o755)   # read-only from the previous run
-            except OSError:
-                pass
-        copied = []
-        for uid in ups:
-            task = self._store.load(uid)
-            if task is None or not task.artifacts:
+    def _descendants_of(self, eid):
+        """Ids of ALL descendant eggs (transitive: edges leaving eid, then theirs)."""
+        children = {}
+        for v in self.edges.values():
+            children.setdefault(v["from"], []).append(v["to"])
+        out, stack, seen = [], list(children.get(eid, [])), {eid}
+        while stack:
+            cur = stack.pop()
+            if cur in seen or cur not in self.eggs:
                 continue
-            # keep unicode letters (Chinese titles) but drop path separators
-            slug = "".join(c if (c.isalnum() or c in "._-") else "-"
-                           for c in (task.title or uid))[:40].strip("-") or uid
-            for art in task.artifacts:
-                src = Path(art.path)
-                if not src.is_file():
-                    continue
-                if any(p in ("agent_data", "__pycache__", "shared")
-                       for p in src.parts):
-                    continue
-                dest_dir = dest_root / slug
-                try:
-                    dest_dir.mkdir(parents=True, exist_ok=True)
-                    dest_dir.chmod(0o755)   # may be 0555 from a previous run
-                    dest = dest_dir / src.name
-                    if dest.exists():
-                        dest.chmod(0o644)
-                    shutil.copy2(src, dest)
-                    # Upstream output is a REFERENCE, not scratch space: a
-                    # downstream egg must not "fix" the upstream worktree by
-                    # editing this copy and silently lose the change.
-                    dest.chmod(0o444)
-                    dest_dir.chmod(0o555)
-                except OSError:
-                    continue
-                copied.append((task.title or uid, f"shared/{slug}/{src.name}"))
-        if copied:
-            try:
-                # The whole tree is INPUT: make it unwritable so an egg that
-                # mistakes shared/ for its own workspace fails loudly instead
-                # of losing its deliverable in a copy.
-                dest_root.chmod(0o555)
-            except OSError:
-                pass
-        return copied
+            seen.add(cur)
+            out.append(cur)
+            stack.extend(children.get(cur, []))
+        return out
 
-    def _shared_note(self, copied):
-        if not copied:
+    def _peer_dirs(self, egg):
+        """Worktree directories this egg may READ: upstream + parallel nodes.
+
+        Replaces the old <worktree>/shared/ copy: instead of copying upstream
+        deliverables in, the prompt points the egg at the LIVE directories of
+        its upstream (already-complete ancestors) and its parallel peers
+        (unrelated branches running concurrently). Downstream descendants are
+        NEVER included — their results do not exist yet. Parallel peers may
+        legitimately have no evidence yet (they run at the same time).
+        """
+        upstream = {u for u in self.upstream_of(egg.id) if u in self.eggs}
+        downstream = set(self._descendants_of(egg.id))
+        peers, seen_paths = [], set()
+        for oid, other in self.eggs.items():
+            if oid == egg.id or oid in downstream:
+                continue
+            role = "upstream" if oid in upstream else "parallel"
+            path = str(other.worktree)
+            if path in seen_paths:
+                continue
+            seen_paths.add(path)
+            peers.append((role, other.title, path))
+        return peers
+
+    def _peer_note(self, peers):
+        if not peers:
             return ""
-        lines = ["【上游交付物（只读）已放入你工作区的 shared/ 目录】"]
-        lines += [f"- {title}: {rel}" for title, rel in copied]
+        lines = ["【上游与平行节点的工作目录（只读，可直接读取）】"]
+        lines += [f"- [{'上游' if role == 'upstream' else '平行'}] {title}: {path}"
+                  for role, title, path in peers]
         lines += [
-            "（注意：shared/ 是只读输入，写入会失败；你的交付物必须写到工作区",
-            "根目录，例如 ./REVIEW.md。上文出现的其他蛋的绝对路径属于它们的",
-            "工作区，你无权访问。）",
+            "说明：",
+            "- 上游节点的交付物/证据已就绪，可直接读取。",
+            "- 平行节点与本节点并发执行，其目录内的证据可能尚未生成或不完整，"
+            "读取时以实际存在为准。",
+            "- 上述目录仅供读取，禁止写入或修改；你的交付物必须写到你自己的"
+            "工作区根目录。",
         ]
         return "\n".join(lines)
 
@@ -1029,13 +1265,14 @@ Rules:
                          "attempt": int(task.metadata.get("attempt", 1))})
             self._bus.publish(assign)
             egg.current_assign_id = assign.msg_id
-            shared = self._share_upstream(egg)
+            peers = self._peer_dirs(egg)
+            await egg.set_read_dirs([path for _role, _title, path in peers])
             ctx = ctx_fn(egg) or ""
-            note = self._shared_note(shared)
+            note = self._peer_note(peers)
             if note:
                 ctx = f"{ctx}\n\n{note}".strip()
                 await q.put({"k": "say", "egg": "commander",
-                             "text": f"📦 {egg.title} 收到上游交付物 {len(shared)} 个（shared/）"})
+                             "text": f"🔗 {egg.title} 已挂载上游/平行节点目录（只读）"})
             try:
                 async for ev in self._run_egg(egg, instruction_for(egg), ctx):
                     await q.put(ev)
@@ -1155,6 +1392,7 @@ CRITICAL rules:
 - You are a DECISION-MAKER ONLY. You do NOT use tools, create tasks, or execute anything. Your response is just a JSON object describing what should happen.
 - For "replan", simply DESCRIBE new tasks in JSON. Do NOT attempt to call any tool or create anything yourself.
 - In depends_on, ALWAYS reference existing eggs by their exact TITLE, never by their id. Only reference titles of tasks you are creating in this same plan, or titles already on the canvas.
+- Each new task may depend on AT MOST ONE prerequisite, and the combined graph must keep a UNIQUE path to every node: never create a diamond where a task is reachable two ways (e.g. A->C and A->B->C). Chain prerequisites in order instead.
 - Questions like "需要产物吗" or "进度如何" are answer actions, not run actions.
 - Never infer completion from a status string alone; use TaskCompleted and artifacts/report fields.
 - Include brief reasoning and a concise reply in the JSON.
@@ -1168,9 +1406,23 @@ CRITICAL rules:
                 agent_behavior=types.AgentBehavior.MINIMAL))
         async with Agent(config) as agent:
             response = await agent.chat(text)
-            data = await response.structured_output()
+            # structured_output() drains the stream internally — the same
+            # hang risk as resolve(); bound it and abort both sides on
+            # timeout (see _plan_with_agent).
+            structured_task = asyncio.ensure_future(response.structured_output())
+            try:
+                data = await asyncio.wait_for(
+                    asyncio.shield(structured_task),
+                    timeout=_env_float("CANVAS_COMMANDER_RESOLVE_TIMEOUT", 250.0))
+            except asyncio.TimeoutError:
+                try:
+                    await response.cancel()
+                except Exception:
+                    pass
+                _abort_server_request()
+                structured_task.cancel()
+                raise
             if not isinstance(data, dict):
-                data = await response.text()
                 data = _extract_json(await response.text())
         if not isinstance(data, dict):
             raise ValueError("commander decision must be a JSON object")
@@ -1195,6 +1447,15 @@ CRITICAL rules:
                 str(key).strip(): str(value) for key, value in data.get("instructions", {}).items()
                 if str(key).strip()
             }
+        # 全局轨迹：总指挥的模型回复与决策（action/reasoning）。
+        if self._trace is not None:
+            self._trace.append("commander", "总指挥", "assistant", "text",
+                               text=str(data.get("reply") or ""))
+            self._trace.append("commander", "总指挥", "system", "decision",
+                               text=(f"action={data.get('action')} "
+                                     f"reasoning={str(data.get('reasoning') or '')[:2000]}"))
+            self._trace.append("commander", "总指挥", "system", "turn_end",
+                               text=f"stop_reason={response.stop_reason} usage={_usage_text(response)}")
         return data
 
     async def _commander_execute_replan(self, decision, text):
@@ -1224,6 +1485,7 @@ CRITICAL rules:
         # asked to remove so a dep on a soon-to-be-deleted egg still fails.
         id_to_title = {egg.id: egg.title for egg in self.eggs.values()
                        if egg.id not in remove_set}
+        dropped = []   # filled when multi-parent new tasks are pruned below
         try:
             def _resolve_dep_ids(task):
                 if not isinstance(task, dict):
@@ -1265,6 +1527,12 @@ CRITICAL rules:
                 for dep in deps:
                     source_id = placeholder[dep] if dep in placeholder else existing_by_title[dep].id
                     edges.append((source_id, placeholder[title]))
+            # Enforce a unique path to every new node (in-degree <= 1): a node
+            # reachable two ways (A->C and A->B->C) keeps only its deepest
+            # parent. Run before the acyclic check so the validated graph is
+            # exactly the one we build below.
+            edges, dropped = _enforce_unique_paths(
+                nodes, edges, list(placeholder.values()))
             _assert_acyclic(nodes, edges)
         except Exception as exc:  # noqa: BLE001
             yield {"k": "say", "egg": "commander",
@@ -1290,14 +1558,15 @@ CRITICAL rules:
             created_by_title[title] = await self.add_egg(
                 title, prompt, x=120 + col * 380, y=160 + row * 240)
 
-        # --- Step 3: wire up dependencies ---
-        title_to_egg = {title: values[0] for title, values in existing_title_lists.items()}
-        title_to_egg.update(created_by_title)
-        for title, _prompt, deps in normalized:
-            for dep in deps:
-                if dep in title_to_egg and title in created_by_title:
-                    await self.add_edge(
-                        title_to_egg[dep].id, created_by_title[title].id)
+        # --- Step 3: wire up dependencies (only the pruned, unique-path edges) ---
+        created_id_by_placeholder = {
+            placeholder[title]: created_by_title[title].id
+            for title in created_by_title}
+        for source_id, target_id in edges:
+            if target_id in created_id_by_placeholder:
+                source_egg_id = created_id_by_placeholder.get(source_id, source_id)
+                await self.add_edge(
+                    source_egg_id, created_id_by_placeholder[target_id])
 
         self.save()
 
@@ -1308,6 +1577,14 @@ CRITICAL rules:
         if removed:
             msg += f"，移除 {len(removed)} 个旧蛋（{', '.join(removed)}）"
         msg += "；依赖已校验，开始执行新任务。"
+        if dropped:
+            placeholder_to_title = {v: k for k, v in placeholder.items()}
+
+            def _label(nid):
+                return placeholder_to_title.get(nid) or id_to_title.get(nid) or nid
+
+            pruned = "；".join(f"{_label(p)}→{_label(t)}" for p, t in dropped)
+            msg += f"\n🔗 已收敛为唯一到达路径（每节点仅一条上游链），移除重复上游边：{pruned}"
         yield {"k": "say", "egg": "commander", "text": msg}
 
         async for ev in self._run_graph(
@@ -1318,9 +1595,12 @@ CRITICAL rules:
     async def commander_run(self, text, targets):
         """Route commander chat safely; never execute every egg on decision failure."""
         decision, failure = None, None
+        # 全局轨迹：操作员发给总指挥的消息。
+        if self._trace is not None and text:
+            self._trace.append("commander", "总指挥", "user", "text", text=text)
         if SDK_OK:
             try:
-                timeout = _env_float("CANVAS_COMMANDER_DECIDE_TIMEOUT", 60.0)
+                timeout = _env_float("CANVAS_COMMANDER_DECIDE_TIMEOUT", 260.0)
                 decision = await asyncio.wait_for(self._commander_decide(text), timeout=timeout)
             except Exception as exc:  # noqa: BLE001
                 failure = exc
@@ -1553,6 +1833,9 @@ CRITICAL rules:
             raise FileNotFoundError(sid)
         self.session_id = sid
         self.session_dir = d
+        # 加载该会话的全局模型调用轨迹（JSONL），供前端「全局」标签展示。
+        self._trace.set_path(d / "global_trace.jsonl")
+        self._trace.load()
         self.eggs.clear()
         self.edges.clear()
         data = json.loads((d / "canvas.json").read_text(encoding="utf-8"))
@@ -1566,6 +1849,7 @@ CRITICAL rules:
                 conversation_id=spec.get("conversation_id"),
                 bus=self._bus, store=self._store, state=self._state,
                 metrics=self._metrics, audit=self._audit, context=self._context,
+                trace=self._trace,
             )
             self.eggs[spec["id"]] = egg
             restored = spec.get("transcript") or []

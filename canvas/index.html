@@ -220,6 +220,7 @@
     <span id="convBadge"></span>
     <button id="cmdBtn">🎯 总指挥</button>
     <button id="statusBtn">📊 状态</button>
+    <button id="globalTraceBtn">🌐 全局轨迹</button>
   </div>
 
   <div id="stage">
@@ -409,12 +410,14 @@ function handle(m){
         refreshEggPanel(m.eggId);
       }
       if(traceKey===m.eggId) fetchTrace(m.eggId);
+      if(traceKey==='global') fetchGlobalTrace();
       break;
     }
     case 'system': {
       // System notes belong to the 轨迹 — the chat box stays user + assistant.
-      if(m.eggId==='commander'){ toast(m.text); if(traceKey==='commander') fetchTrace('commander'); break; }
+      if(m.eggId==='commander'){ toast(m.text); if(traceKey==='commander') fetchTrace('commander'); if(traceKey==='global') fetchGlobalTrace(); break; }
       if(traceKey===m.eggId) fetchTrace(m.eggId);
+      if(traceKey==='global') fetchGlobalTrace();
       toast(m.text);
       break;
     }
@@ -516,13 +519,17 @@ function clearHistory(eggId){
     cmdActFinish();
     delete activeStream['commander'];
     setCmdStatus('idle');
-    // Clear the trace cache so the 轨迹 modal doesn't show stale records
+    // Clear the trace caches so the 轨迹 modal doesn't show stale records
     // from the previous session.
     if(traceKey === 'commander'){
       _traceCache = null;
       _traceCacheKey = null;
       fetchTrace('commander');
     }
+    // The 全局 tab keeps its own incremental cache — reset it too so a
+    // reloaded/new session doesn't mix old entries into the global stream.
+    _globalCache = []; globalLastId = 0;
+    if(traceKey === 'global') fetchGlobalTrace();
     return;
   }
   const e = state.eggs[eggId];
@@ -953,10 +960,14 @@ $('#reasonChk').addEventListener('change', ev=>{
 
 /* ---------- trace (conversation records, time-ordered) ---------- */
 let traceKey = null, traceTimer = null, _traceLast = 0, traceShowAll = false, _traceCache = null, _traceCacheKey = null;
-function traceURL(key){ return key==='commander' ? '/api/trace/commander' : `/api/trace/${key}`; }
+let globalLastId = 0, _globalCache = [];
+function traceURL(key){
+  if(key==='global') return '/api/trace/global';
+  return key==='commander' ? '/api/trace/commander' : `/api/trace/${key}`;
+}
 function refreshTraceThrottled(){
   const now=Date.now();
-  if(now-_traceLast>=500){ _traceLast=now; if(traceKey) fetchTrace(traceKey); }
+  if(now-_traceLast>=500){ _traceLast=now; if(traceKey==='global') fetchGlobalTrace(); else if(traceKey) fetchTrace(traceKey); }
 }
 async function fetchTrace(key){
   if(!key) return;
@@ -965,10 +976,85 @@ async function fetchTrace(key){
     if(r.ok){ const d=await r.json(); _traceCache=d; _traceCacheKey=key; renderTrace(d, key); }
   }catch(e){}
 }
+/* 全局模型调用轨迹：/api/trace/global 只返回 id > since 的新条目，增量追加
+   渲染；配合 1.5s 轮询即近实时的全局模型调用流（蛋 + 总指挥 + 规划器）。 */
+async function fetchGlobalTrace(){
+  if(traceKey !== 'global') return;
+  try{
+    const r=await fetch(traceURL('global') + '?since=' + globalLastId);
+    if(!r.ok) return;
+    const d=await r.json();
+    if(d.id) globalLastId = d.id;
+    const entries = d.entries || [];
+    if(!entries.length) return;
+    if(globalLastId === 0){
+      $('#traceTitle').textContent = '全局模型调用轨迹';
+    }
+    appendGlobalEntries(entries);
+  }catch(e){}
+}
+function globalTraceItem(it){
+  const div=document.createElement('div');
+  div.className='trace-item';
+  const ts=(it.ts||'').split('T')[1] || it.ts || '';
+  const KIND_LABEL={user:'用户',system:'系统',assistant:'模型',tool:'工具',thought:'思考',tool_call:'工具调用',tool_result:'工具结果',system_prompt:'系统提示词',tools:'可用工具',prompt:'发送提示词',plan:'指挥计划',status:'状态',phase:'阶段',instruct:'派发指令',report:'子蛋复命',planner_prompt:'规划输入',planner_reply:'规划回复',turn_end:'轮次结束',decision:'决策',sandbox:'沙箱'};
+  const kindLabel = KIND_LABEL[it.kind] || it.kind;
+  const roleCls = it.role==='user'?'user':(it.role==='assistant'?'assistant':(it.role==='tool'?'tool':'system'));
+  const who = it.agentTitle ? it.agentTitle : (it.agent || '?');
+  let head = `<span class="role ${roleCls}">${esc(who)}</span>`;
+  head += `<span class="kind">${esc(it.role)}</span><span class="kind">${esc(kindLabel)}</span>`;
+  if(it.name) head += `<span class="kind">${esc(it.name)}</span>`;
+  if(it.kind==='thought') head += `<span class="kind ttoggle">▾ 折叠</span>`;
+  head += `<span style="margin-left:auto;">${esc(ts)}</span>`;
+  const isPrompt = it.kind==='system_prompt' || it.kind==='prompt' || it.kind==='planner_prompt' || it.kind==='tools' || it.kind==='plan';
+  const isThought = it.kind==='thought';
+  let content = it.text!=null ? `<div class="content${isPrompt?' prompt':''}${isThought?' thought':''}">${isThought?'💭 ':''}${esc(it.text)}</div>` : '';
+  let extra='';
+  if(it.kind==='tool_call' && it.args!=null){
+    const a = typeof it.args==='string' ? it.args : JSON.stringify(it.args,null,2);
+    extra=`<div class="args">参数：${esc(a)}</div>`;
+  } else if(it.kind==='tool_result'){
+    let rr='';
+    if(it.error!=null) rr='错误：'+esc(it.error);
+    else if(it.result!=null) rr = esc(typeof it.result==='string' ? it.result : JSON.stringify(it.result,null,2));
+    if(rr) extra=`<div class="args">${rr}</div>`;
+  }
+  div.innerHTML = `<div class="th">${head}</div>${content}${extra}`;
+  if(isThought){
+    div.style.cursor='pointer';
+    const toggle=div.querySelector('.ttoggle');
+    div.addEventListener('click', ()=>{
+      div.classList.toggle('tcollapsed');
+      if(toggle) toggle.textContent = div.classList.contains('tcollapsed') ? '▸ 展开' : '▾ 折叠';
+    });
+  }
+  return div;
+}
+function appendGlobalEntries(entries){
+  const body=$('#traceBody');
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
+  for(const it of entries){
+    _globalCache.push(it);
+    body.appendChild(globalTraceItem(it));
+  }
+  if(nearBottom) body.scrollTop = body.scrollHeight;
+}
+function renderGlobalFromCache(){
+  const body=$('#traceBody');
+  body.innerHTML='';
+  const list=_globalCache.filter(it=> it && (traceShowAll || ((it.role==='user'||it.role==='assistant') && it.kind!=='thought')));
+  if(!list.length){
+    body.innerHTML='<div class="trace-item"><div class="empty">暂无全局轨迹。生成 / 运行 / 指挥 / 规划产生的每一次模型调用都会按时间顺序出现在这里。</div></div>';
+    return;
+  }
+  for(const it of list) body.appendChild(globalTraceItem(it));
+  body.scrollTop = body.scrollHeight;
+}
 // 「显示全部」开关：用缓存的数据即时重渲染，不必再等一次 fetch。
 $('#traceAll').onchange = e=>{
   traceShowAll = e.target.checked;
-  if(_traceCache && _traceCacheKey===traceKey) renderTrace(_traceCache, traceKey);
+  if(traceKey==='global') renderGlobalFromCache();
+  else if(_traceCache && _traceCacheKey===traceKey) renderTrace(_traceCache, traceKey);
 };
 function renderTrace(data, key){
   const label = key==='commander' ? '总指挥' : (data.title || key);
@@ -1028,10 +1114,11 @@ function renderTrace(data, key){
     body.scrollTop=prevTop;             // keep the user's manual position
   }
 }
-/* Build the tab bar: 总指挥 + every egg (idea / sub), clickable to switch. */
+/* Build the tab bar: 🌐全局（所有模型调用的合并流）+ 总指挥 + every egg. */
 function buildTraceTabs(active){
   const bar=$('#traceTabs'); bar.innerHTML='';
-  const tabs=[{key:'commander', label:'总指挥', kind:'commander'}];
+  const tabs=[{key:'global', label:'🌐 全局', kind:'global'},
+              {key:'commander', label:'总指挥', kind:'commander'}];
   for(const e of Object.values(state.eggs)){
     tabs.push({key:e.id, label:(e.parent?('↳ '+e.title):e.title), kind:e.type, parent:e.parent});
   }
@@ -1039,7 +1126,7 @@ function buildTraceTabs(active){
     const b=document.createElement('button');
     b.className='ttab'+(t.key===active?' active':'');
     b.dataset.key=t.key;
-    const klabel = t.kind==='idea' ? 'idea' : (t.kind==='commander' ? '指挥' : '子蛋');
+    const klabel = t.kind==='global' ? '全局' : (t.kind==='idea' ? 'idea' : (t.kind==='commander' ? '指挥' : '子蛋'));
     b.innerHTML = `${esc(t.label)}<span class="k">${klabel}</span>`;
     b.addEventListener('click', ()=> selectTraceTab(t.key));
     bar.appendChild(b);
@@ -1048,15 +1135,26 @@ function buildTraceTabs(active){
 function selectTraceTab(key){
   traceKey=key;
   [...$('#traceTabs').children].forEach(b=> b.classList.toggle('active', b.dataset.key===key));
-  fetchTrace(key);
+  if(key==='global') fetchGlobalTrace(); else fetchTrace(key);
 }
 function openTrace(key){
   traceKey=key;
   $('#traceModal').classList.add('open');
   buildTraceTabs(key);
-  selectTraceTab(key);
+  if(key==='global'){
+    // 全局标签：先完整拉取一次（since=0），之后增量流式追加新条目。
+    globalLastId=0; _globalCache=[];
+    $('#traceBody').innerHTML='';
+    $('#traceConn').textContent='';
+    fetchGlobalTrace();
+  } else {
+    selectTraceTab(key);
+  }
   if(traceTimer) clearInterval(traceTimer);
-  traceTimer=setInterval(()=>{ if(traceKey) fetchTrace(traceKey); }, 1500);
+  traceTimer=setInterval(()=>{
+    if(traceKey==='global') fetchGlobalTrace();
+    else if(traceKey) fetchTrace(traceKey);
+  }, 1500);
 }
 function closeTrace(){
   $('#traceModal').classList.remove('open');
@@ -1064,6 +1162,7 @@ function closeTrace(){
   if(traceTimer){ clearInterval(traceTimer); traceTimer=null; }
 }
 $('#cmdTrace').addEventListener('click', ()=> openTrace('commander'));
+$('#globalTraceBtn').addEventListener('click', ()=> openTrace('global'));
 $('#traceX').addEventListener('click', closeTrace);
 $('#traceModal').addEventListener('click', e=>{ if(e.target.id==='traceModal') closeTrace(); });
 

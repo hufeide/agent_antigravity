@@ -7,6 +7,11 @@ local_models.py: the LiteRT model path is only needed if you explicitly choose
 
   IDEA_BACKEND=openai  -> local OpenAI-compatible server (Ollama / LM Studio /
                          vLLM). DEFAULT. Needs a server at OPENAI_BASE_URL.
+                         Cloud OpenAI APIs that require Bearer auth (e.g. the
+                         iFlytek Spark MaaS) cannot be reached directly — the
+                         harness sends no Authorization header — so run
+                         demo/maas_proxy.py locally and point OPENAI_BASE_URL
+                         at it (see TECHNICAL_DOC.md "接入讯飞星火 MaaS").
   IDEA_BACKEND=litert  -> on-device LiteRT-LM (.litertlm, run `litert-lm import`
                          first; only then is GEMMA4_MODEL_PATH used).
   IDEA_BACKEND=cloud   -> Google Antigravity cloud (GEMINI_API_KEY or Vertex env).
@@ -32,6 +37,15 @@ SESSIONS_DIR = WORKSPACE / "sessions"
 SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ---- Backend selection ----
+# Load demo/.env (secrets like MAAS_API_KEY) before reading env vars.
+# Existing real env vars take precedence (load_dotenv default: no override).
+try:
+    from dotenv import load_dotenv  # noqa: E402
+
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass  # python-dotenv not installed: rely on real env vars only
+
 # Default to the local OpenAI-compatible server (no .litertlm file required).
 BACKEND = os.environ.get("IDEA_BACKEND", "openai").lower()
 
@@ -64,7 +78,8 @@ GEMMA4_MODEL_PATH = os.environ.get(
     os.path.expanduser("~/.litert-lm/models/gemma4-26b/model.litertlm"),
 )
 
-# local OpenAI-compatible
+# local OpenAI-compatible. Default port 9000 also serves demo/maas_proxy.py,
+# the local proxy that adds Bearer auth for cloud OpenAI APIs (Spark MaaS).
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:9000/v1")
 
 
@@ -134,11 +149,13 @@ def is_stream_stall_error(err):
     """True when the client-side stream watchdog aborted the model turn.
 
     The harness aborts a turn after ~120s of stream silence ("model stream
-    stalled" / "模型流静默超过120s"). This is distinct from "the server is
-    down": llama.cpp streams nothing during prefill, and cannot detect the
-    client disconnect mid-prefill, so the aborted request may keep burning a
-    slot. Callers should probe the server and wait for slot release instead
-    of blindly retrying or rebuilding the harness.
+    stalled: <reason>"). This is distinct from "the server is down": llama.cpp
+    streams nothing during prefill, and cannot detect the client disconnect
+    mid-prefill, so the aborted request may keep burning a slot. Callers should
+    probe the server and wait for slot release instead of blindly retrying or
+    rebuilding the harness. The watchdog itself is server-aware (polls /slots
+    during the silence); <reason> is one of timeout / dead_stream / slow_prefill
+    / zombie / server_down.
     """
     if err is None:
         return False

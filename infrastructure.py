@@ -361,10 +361,39 @@ def _tool_args_text(args: Any) -> str:
     return str(getattr(args, "CommandLine", "") or args)
 
 
+# Path argument keys used by the SDK's file tools (see hooks/policy_test.py).
+_FILE_PATH_KEYS = ("path", "file_path", "TargetFile", "directory_path")
+
+
+def _tool_path(args: Any) -> str:
+    """Best-effort extraction of the target path from a file-tool call's args."""
+    if isinstance(args, dict):
+        for key in _FILE_PATH_KEYS:
+            value = args.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+    for key in _FILE_PATH_KEYS:
+        value = getattr(args, key, None)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _path_within(path: str, root: str) -> bool:
+    """True when ``path`` is ``root`` itself or lives underneath it."""
+    if not path or not root:
+        return False
+    p = os.path.abspath(path)
+    r = os.path.abspath(root)
+    return p == r or p.startswith(r + os.sep)
+
+
 def build_agent_policies(
     worktree: str | os.PathLike[str],
     denied_commands: Sequence[str] | None = None,
     allow_all: bool = True,
+    read_dirs: Sequence[str | os.PathLike[str]] | None = None,
 ) -> list[Any]:
     """Build the SDK policy list for one egg.
 
@@ -372,10 +401,18 @@ def build_agent_policies(
     destructive shell commands are denied. File tools are scoped with the
     SDK's real policy.workspace_only (a specific deny beats the wildcard
     allow), while everything else remains autonomous.
+
+    ``read_dirs`` lists EXTRA directories the egg may READ but never write —
+    the worktrees of its upstream + parallel nodes (see Canvas._peer_dirs).
+    They are added to the platform workspace containment so file tools can
+    reach them, and a per-path deny keeps CREATE_FILE/EDIT_FILE confined to
+    ``worktree`` so a downstream egg can never mutate an upstream's live files.
     """
     if not SDK_AVAILABLE:
         return []
-    policies: list[Any] = list(policy.workspace_only([str(worktree)]))
+    own = str(worktree)
+    read_dirs = [str(d) for d in (read_dirs or []) if d and str(d) != own]
+    policies: list[Any] = list(policy.workspace_only([own] + read_dirs))
     patterns = DEFAULT_DANGEROUS_COMMANDS if denied_commands is None else denied_commands
     for pattern in patterns:
         policies.append(
@@ -384,6 +421,19 @@ def build_agent_policies(
                 when=lambda args, _p=pattern: _p in _tool_args_text(args),
                 name="deny_dangerous_command",
                 reason=f"command contains {pattern!r}",
+            )
+        )
+    # Peer/upstream directories are read-only inputs: allow reading them but
+    # keep every write inside this egg's own worktree.
+    own_abs = os.path.abspath(own)
+    for tool in ("create_file", "edit_file"):
+        policies.append(
+            policy.deny(
+                tool,
+                when=lambda args, _w=own_abs: not _path_within(_tool_path(args), _w),
+                name="deny_write_outside_worktree",
+                reason="upstream/parallel node directories are read-only; "
+                       "write deliverables to your own worktree",
             )
         )
     policies.append(policy.allow_all() if allow_all else policy.deny_all())

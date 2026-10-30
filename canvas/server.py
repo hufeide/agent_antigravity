@@ -81,6 +81,21 @@ async def read_file(egg_id: str, path: str = Query(...)):
     return {"path": path, "content": content}
 
 
+@app.get("/api/trace/global")
+async def trace_global(since: int = 0):
+    """全局模型调用轨迹：所有蛋 + 总指挥 + 规划器的模型对话按时间合并。
+
+    Declared BEFORE /api/trace/{egg_id} so 'global' is not captured as an egg id.
+    ``since`` 只返回 id 更大的新条目，供前端增量流式拉取（1.5s 轮询即
+    近实时的全局流）。
+    """
+    canvas: Canvas = app.state.canvas
+    return {
+        "id": canvas._trace.last_id(),
+        "entries": canvas._trace.since(since),
+    }
+
+
 @app.get("/api/trace/commander")
 async def trace_commander():
     """Chronological coordinator trace for the Commander.

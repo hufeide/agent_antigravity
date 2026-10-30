@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 import time
@@ -44,9 +45,16 @@ _WRITE_TOOLS = frozenset({"create_file", "edit_file", "write_file", "delete_file
 # ensuring one transient failure never bricks the egg for the process lifetime.
 _START_RETRY_COOLDOWN = 30.0
 
-# A task that names a file (REPORT.md, impl.py, ...) or asks to write one
-# REQUIRES an artifact: a text-only reply that claims "done" must not pass.
+# A task that names a file (REPORT.md, impl.py, ...), asks to write one, or
+# states a "Deliverable:" REQUIRES an artifact: a text-only reply that claims
+# "done" must not pass.
 _FILE_EXT = r"(?:md|markdown|txt|py|json|ya?ml|csv|tsv|html|css|js|ts|sh|toml|ini|sql|xml)"
+
+# Document-like nouns that, following a producing verb, mean "create a file".
+_DOC_WORDS = (
+    "file|document|report|script|markdown|deliverable|workbook|"
+    "spreadsheet|paper|essay|proposal"
+)
 
 # Sent once when a file task produced no file at all.
 _NUDGE_PROMPT = (
@@ -55,7 +63,11 @@ _NUDGE_PROMPT = (
     "view_file 确认，再用一句话说明你写了什么。"
 )
 _ARTIFACT_HINT = re.compile(
-    rf"[\w./-]+\.{_FILE_EXT}\b|写入|写出|写进|创建文件|生成文件|保存为|保存到|写到",
+    rf"[\w./-]+\.{_FILE_EXT}\b"
+    r"|写入|写出|写进|创建文件|生成文件|保存为|保存到|写到"
+    r"|deliverable"
+    rf"|\b(?:write|create|produce|generate|save|draft|author|compile|build|"
+    rf"prepare|formulate|compose)\b[^.\n]{{0,60}}\b(?:{_DOC_WORDS})\b",
     re.IGNORECASE,
 )
 
@@ -118,6 +130,35 @@ _TURN_TIMEOUT = float(os.environ.get("EGG_TURN_TIMEOUT", "300"))
 # frozen. Abort the turn instead so the egg returns to 空闲 promptly.
 _STALL_TIMEOUT = float(os.environ.get("EGG_STALL_TIMEOUT", "120"))
 
+# The blind silence watchdog above cannot distinguish "the server is doing a
+# LONG prefill (llama.cpp/LM Studio stream nothing while processing the prompt,
+# and a 45k-token prompt on a 4B model can take minutes)" from "the stream is
+# dead". While waiting for the next chunk we therefore also poll the server's
+# /slots endpoint (llama.cpp / LM Studio compat) and decide by server state:
+#   - slow_prefill : processing AND progress advancing -> extend the wait
+#   - dead_stream  : server idle but no chunk arrived   -> abort immediately
+#   - zombie       : processing but progress frozen    -> abort immediately
+#   - server_down  : unreachable during the silence    -> abort immediately
+#   - timeout      : no /slots data at all             -> old blind behaviour
+_STALL_PROBE_INTERVAL = float(os.environ.get("EGG_STALL_PROBE_INTERVAL", "15"))
+_ZOMBIE_TIMEOUT = float(os.environ.get("EGG_ZOMBIE_TIMEOUT", "90"))
+_STALL_EXTENSIONS = int(os.environ.get("EGG_STALL_EXTENSIONS", "2"))
+
+
+class _StallDiagnosis(RuntimeError):
+    """The silence watchdog fired, carrying a server-aware reason.
+
+    ``reason`` is one of timeout / dead_stream / slow_prefill / zombie /
+    server_down. ``retryable=True`` means "the server is alive and working —
+    extend the wait" rather than "abort and retry the turn".
+    """
+
+    def __init__(self, reason, message, retryable=False):
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+        self.retryable = retryable
+
 # The SDK exposes the model's thinking as standard stream data
 # (ChatResponse.thoughts / types.Thought). EggAgent._chat_once records those
 # chunks directly, so no separate probe call is needed.
@@ -143,7 +184,7 @@ def _chunk_to_text(chunk):
 class EggAgent:
     def __init__(self, id, title, prompt, type_, position, subagents=None, parent=None,
                  session_dir=None, conversation_id=None, bus=None, store=None,
-                 state=None, metrics=None, audit=None, context=None):
+                 state=None, metrics=None, audit=None, context=None, trace=None):
         self.id = id
         self.title = title
         self.prompt = prompt
@@ -167,6 +208,12 @@ class EggAgent:
         self.worktree: Path = (self.session_dir / "worktrees" / parent / id
                                if parent else self.session_dir / "worktrees" / id)
         self.worktree.mkdir(parents=True, exist_ok=True)
+        # Extra directories this egg may READ but never write: the worktrees of
+        # its upstream + parallel nodes (see Canvas._peer_dirs). Injected into
+        # the SDK `workspaces` config (so file tools can reach them) and into
+        # the prompt as directory references, replacing the old shared/ copy.
+        self.read_dirs: list[str] = []
+        self._started_read_dirs: list[str] | None = None
         # touch a placeholder file so "review code" has something to show
         scope = f" (sub-egg of `{parent}`)" if parent else ""
         (self.worktree / "README.md").write_text(
@@ -222,6 +269,10 @@ class EggAgent:
         self._metrics = metrics if metrics is not None else infrastructure.Metrics()
         self._audit = audit if audit is not None else infrastructure.AuditLog()
         self._context = context
+        # Global model-call trace sink (demo/canvas/trace.py). When set, every
+        # transcript record is mirrored into the canvas-wide chronological
+        # stream so the frontend 全局 tab can show all LLM traffic.
+        self._trace = trace
         # msg_id of the TASK_ASSIGN that started the current run (correlation).
         self.current_assign_id = None
         self.last_task = None
@@ -261,6 +312,10 @@ class EggAgent:
         self._used_file_tools = False
         # Stall watchdog counter (no model chunk for _STALL_TIMEOUT).
         self._stalls = 0
+        # Cached answer to "does the model server expose /slots?" (llama.cpp /
+        # LM Studio do; when not, the server-aware stall probe is disabled and
+        # the watchdog falls back to the plain silence timeout).
+        self._slots_ok = None
         # The instruction text for the current run (used by _needs_write_nudge
         # and the artifact-requirement heuristic).
         self._last_instruction = ""
@@ -353,7 +408,7 @@ Rules:
         return agent_runtime.build_agent_config(
             si,
             **backend_options(),
-            workspaces=[str(self.worktree)],
+            workspaces=[str(self.worktree)] + list(self.read_dirs),
             app_data_dir=str(self.worktree / "agent_data"),
             save_dir=str(self.session_dir / "agent_data"),
             # When resuming we pass the stable per-egg id so the SDK restores the
@@ -364,7 +419,8 @@ Rules:
             # link.md 一.6: file tools are scoped to THIS worktree and obviously
             # destructive shell commands are denied; everything else stays
             # autonomous. (Specific denies beat the wildcard allow.)
-            policies=infrastructure.build_agent_policies(self.worktree),
+            policies=infrastructure.build_agent_policies(
+                self.worktree, read_dirs=self.read_dirs),
             # Resource caps (link.md 一.6) are OPT-IN: SDK budgets are scoped
             # to the whole agent session, so a small default would silently
             # kill a long-lived egg on its third command. Runaway turns are
@@ -547,6 +603,7 @@ Rules:
             return
         try:
             self._cm, self._agent = await self._open_agent(resume=True)
+            self._started_read_dirs = list(self.read_dirs)
             return
         except Exception as ex:
             # A stale conversation id — the session's agent_data was cleared, or
@@ -556,6 +613,7 @@ Rules:
             if is_corrupt_conversation_error(ex):
                 try:
                     self._cm, self._agent = await self._open_agent(resume=False)
+                    self._started_read_dirs = list(self.read_dirs)
                     try:
                         self.conversation_id = (self._agent.conversation_id
                                                 or self.conversation_id)
@@ -581,6 +639,21 @@ Rules:
         self._agent = None
         self._start_state = "stopped"
         self._start_failed_at = 0.0
+
+    async def set_read_dirs(self, dirs):
+        """Point this egg at extra READ-ONLY directories (upstream + parallel nodes).
+
+        The `workspaces` list is baked into the Agent config at creation, so if
+        the agent is already running with a different read set we restart it
+        (resume preserves the conversation) to apply the new scope. No-op when
+        the set is unchanged.
+        """
+        new = [str(d) for d in (dirs or []) if d]
+        if new == self.read_dirs:
+            return
+        self.read_dirs = new
+        if self._agent is not None and self._started_read_dirs != new:
+            await self.stop()
 
     # ---- interactions ----
     async def _ensure_started(self):
@@ -687,12 +760,20 @@ Rules:
         self.last_activity = time.monotonic()
         self.transcript.append(self._entry(role, kind, text=text, name=name,
                                            args=args, result=result, error=error))
+        if self._trace is not None:
+            # Mirror into the canvas-wide global trace: every model-call
+            # dialogue (prompts, thoughts, text, tools, status) in one
+            # time-ordered stream.
+            self._trace.append(self.id, self.title, role, kind, text=text,
+                               name=name, args=args, result=result, error=error)
 
     def _record_text(self, text):
         """Append to the last assistant text entry to avoid per-token spam."""
         if (self.transcript and self.transcript[-1]["role"] == "assistant"
                 and self.transcript[-1]["kind"] == "text"):
             self.transcript[-1]["text"] += text
+            if self._trace is not None:
+                self._trace.merge_last(self.id, "text", text)
         else:
             self._record("assistant", "text", text=text)
 
@@ -702,6 +783,8 @@ Rules:
         if (self.transcript and self.transcript[-1]["role"] == "assistant"
                 and self.transcript[-1]["kind"] == "thought"):
             self.transcript[-1]["text"] += text
+            if self._trace is not None:
+                self._trace.merge_last(self.id, "thought", text)
         else:
             self._record("assistant", "thought", text=text)
 
@@ -823,6 +906,9 @@ Rules:
                 # 记录实际发送给模型的完整输入（含注入的邻居上下文）——轨迹必须
                 # 反映模型真实看到的交互内容，而不仅是用户敲下的那句指令。
                 self._record("system", "prompt", text=text)
+                if self._trace is not None:
+                    self._trace.append(self.id, self.title, "user", "prompt",
+                                       text=text)
         self._turn_tool_calls = 0
         self._got_tool_result = False
         self._tc_seen = {"hook": {}, "chunk": {}}
@@ -960,6 +1046,17 @@ Rules:
             self._start_error = reopen_exc
         return True
 
+    def _server_root(self):
+        """llama.cpp/LM Studio native endpoints (/slots, /abort) live at the
+        SERVER ROOT, not under the OpenAI-compatible /v1 prefix that
+        base_url carries — request them with the /v1 suffix stripped.
+        """
+        base = str(backend_options().get("base_url") or "").rstrip("/")
+        if not base:
+            return ""
+        p = urllib.parse.urlparse(base)
+        return f"{p.scheme}://{p.netloc}" if p.path else base
+
     async def _probe_model_server(self):
         """Classify model-server health after a stall/timeout.
 
@@ -974,18 +1071,18 @@ Rules:
         if not base:
             return "unknown"
 
-        def _get(path):
-            req = urllib.request.Request(base + path)
+        def _get(url):
+            req = urllib.request.Request(url)
             with urllib.request.urlopen(req, timeout=3) as r:
                 return json.loads(r.read().decode())
 
         try:
             try:
-                slots = await asyncio.to_thread(_get, "/slots")
+                slots = await asyncio.to_thread(_get, self._server_root() + "/slots")
             except Exception:
                 # llama.cpp serves /slots; other servers may not — /models is
                 # the OpenAI-standard liveness endpoint.
-                await asyncio.to_thread(_get, "/models")
+                await asyncio.to_thread(_get, base + "/models")
                 return "ok"
             if any(s.get("is_processing") for s in slots):
                 return "busy"
@@ -993,18 +1090,177 @@ Rules:
         except Exception:
             return "down"
 
+    def _sample_slots(self):
+        """One /slots snapshot: (any_processing, total_progress_tokens).
+
+        Raises urllib.error.HTTPError on non-2xx (so 404 = "this server has no
+        /slots" can be distinguished from "server unreachable").
+        """
+        root = self._server_root()
+        if not root:
+            raise RuntimeError("no base_url")
+        req = urllib.request.Request(root + "/slots")
+        with urllib.request.urlopen(req, timeout=3) as r:
+            slots = json.loads(r.read().decode())
+        processing = any(s.get("is_processing") for s in slots)
+        progress = sum(
+            int(s.get("n_prompt_tokens_processed") or 0)
+            + int(s.get("n_tokens") or 0)
+            for s in slots)
+        return processing, progress
+
+    def _abort_server_request(self):
+        """Best-effort: ask the server to abort its in-flight request.
+
+        ``resp.cancel()`` only stops the SDK-side reader; llama.cpp cannot
+        detect a client disconnect mid-prefill, so an aborted request keeps
+        burning its slot (a "zombie"). POST /abort (llama.cpp native; LM Studio
+        may answer 404) releases it server-side when the endpoint exists.
+        """
+        root = self._server_root()
+        if not root:
+            return
+        for path in ("/abort", "/api/abort"):
+            try:
+                req = urllib.request.Request(
+                    root + path, data=b"{}",
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=3) as r:
+                    if r.status < 400:
+                        logger.info("[egg %s] aborted in-flight server request "
+                                    "via %s", self.id, path)
+                        return
+            except Exception:
+                continue
+
+    async def _slots_probe_loop(self, state):
+        """Sample /slots every _STALL_PROBE_INTERVAL while a chunk wait runs."""
+        while not state.get("stop"):
+            await asyncio.sleep(_STALL_PROBE_INTERVAL)
+            if state.get("stop"):
+                return
+            try:
+                processing, progress = await asyncio.to_thread(self._sample_slots)
+            except urllib.error.HTTPError as he:
+                if he.code == 404:
+                    # Server reachable but has no /slots: stop probing; the
+                    # watchdog falls back to the plain silence timeout.
+                    state["unsupported"] = True
+                    self._slots_ok = False
+                    return
+                # Reachable but not serving /slots right now (e.g. 503 while
+                # the model is loading / a request is in flight): the server
+                # is alive, we simply have no progress data for this sample.
+                state["down_since"] = None
+                continue
+            except Exception:
+                state["down_since"] = state.get("down_since") or time.monotonic()
+                continue
+            state["down_since"] = None
+            state["saw_processing"] = state["saw_processing"] or processing
+            if not processing:
+                state["saw_idle"] = True
+            if progress != state["progress"]:
+                state["progress"] = progress
+                state["saw_progress"] = True
+                state["last_progress_at"] = time.monotonic()
+
+    async def _next_chunk(self, agen):
+        """Wait for the next stream chunk with a SERVER-AWARE stall watchdog.
+
+        Replaces the blind ``wait_for(anext, _STALL_TIMEOUT)``: while the
+        stream is silent we poll the model server's /slots so we can tell a
+        legitimate long prefill apart from a dead/zombied stream and abort —
+        or extend the wait — immediately instead of after a fixed timeout.
+        """
+        if self._slots_ok is None:
+            try:
+                await asyncio.to_thread(self._sample_slots)
+                self._slots_ok = True
+            except urllib.error.HTTPError as he:
+                # 404 = no /slots endpoint on this server; any other HTTP
+                # status (e.g. 503 while loading) means the endpoint exists.
+                self._slots_ok = he.code != 404
+            except Exception:
+                # First sample unreachable: assume the server may still be
+                # coming up; keep the plain silence timeout this round.
+                self._slots_ok = False
+        if not self._slots_ok:
+            # No /slots on this server (or unreachable at start): fall back
+            # to the plain silence timeout — but still report it as a stall
+            # diagnosis so the caller's abort/retry logic stays uniform.
+            try:
+                return await asyncio.wait_for(agen.__anext__(),
+                                              timeout=_STALL_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise _StallDiagnosis(
+                    "timeout",
+                    f"模型流静默超过 {_STALL_TIMEOUT:g}s，已中止本次尝试。")
+
+        state = {"progress": None, "last_progress_at": time.monotonic(),
+                 "saw_processing": False, "saw_idle": False,
+                 "saw_progress": False, "down_since": None, "stop": False}
+        probe = asyncio.ensure_future(self._slots_probe_loop(state))
+        try:
+            return await asyncio.wait_for(agen.__anext__(), timeout=_STALL_TIMEOUT)
+        except asyncio.TimeoutError:
+            now = time.monotonic()
+            if state["down_since"] is not None:
+                raise _StallDiagnosis(
+                    "server_down",
+                    "模型服务不可达（静默期间多次探测失败），已中止。")
+            if state["saw_idle"] and not state["saw_processing"]:
+                raise _StallDiagnosis(
+                    "dead_stream",
+                    "服务端已空闲但本轮没有任何 chunk（连接已死），已中止。")
+            if state["saw_processing"]:
+                # No progress advance for _ZOMBIE_TIMEOUT while the server
+                # claims to be processing = stuck/zombie prefill.
+                frozen_for = now - state["last_progress_at"]
+                if frozen_for < _ZOMBIE_TIMEOUT:
+                    raise _StallDiagnosis(
+                        "slow_prefill",
+                        "服务端正在处理（prefill 推进中），静默属正常，延长等待。",
+                        retryable=True)
+                raise _StallDiagnosis(
+                    "zombie",
+                    f"服务端槽位被僵尸请求冻结（进度停滞 {frozen_for:.0f}s），"
+                    f"已中止并尝试释放。")
+            raise _StallDiagnosis(
+                "timeout",
+                f"模型流静默超过 {_STALL_TIMEOUT:g}s，已中止本次尝试。")
+        finally:
+            state["stop"] = True
+            probe.cancel()
+
     async def _wait_for_slot_release(self, budget=30.0):
         """Poll until the server has an idle slot (or the budget expires).
 
         Bounded on purpose: if the server stays busy we report rather than
         pile more requests onto it. We never restart the server ourselves —
-        that decision belongs to the operator.
+        that decision belongs to the operator. Returns "ok" / "down" /
+        "busy" / "zombie" (a processing slot whose progress is frozen for the
+        whole budget will never release itself).
         """
         deadline = time.monotonic() + budget
+        last_progress = None
+        frozen_since = None
         while time.monotonic() < deadline:
             state = await self._probe_model_server()
             if state != "busy":
                 return state
+            try:
+                _, progress = await asyncio.to_thread(self._sample_slots)
+                if progress != last_progress:
+                    last_progress = progress
+                    frozen_since = None
+                elif frozen_since is None:
+                    frozen_since = time.monotonic()
+                elif (time.monotonic() - frozen_since
+                      > min(_ZOMBIE_TIMEOUT, budget) * 0.75):
+                    return "zombie"
+            except Exception:
+                pass
             await asyncio.sleep(2.0)
         return "busy"
 
@@ -1071,40 +1327,44 @@ Rules:
                         async with asyncio.timeout(_TURN_TIMEOUT):
                             try:
                                 # Stream with a STALL watchdog: if no chunk arrives
-                                # for _STALL_TIMEOUT the model/server has gone quiet
-                                # (often a truncated/aborted upstream turn). Abort so
-                                # the egg leaves "运行中" and the panel/trace stop
-                                # looking frozen.
+                                # for _STALL_TIMEOUT the model/server may have gone
+                                # quiet (often a truncated/aborted upstream turn).
+                                # _next_chunk additionally polls the server's /slots
+                                # during the silence, so a legitimate long prefill
+                                # (llama.cpp streams nothing while processing) gets
+                                # extra time while a dead/zombied stream aborts
+                                # immediately.
                                 agen = chat.__aiter__()
                                 while True:
                                     try:
-                                        t = await asyncio.wait_for(
-                                            agen.__anext__(),
-                                            timeout=_STALL_TIMEOUT)
+                                        t = await self._next_chunk(agen)
                                     except StopAsyncIteration:
                                         break
-                                    except asyncio.TimeoutError:
-                                        # A silent stream is usually a dead
-                                        # connection (local servers reset
-                                        # under concurrency), not a slow
-                                        # model: retry the turn once before
-                                        # giving up.
+                                    except _StallDiagnosis as diag:
                                         self._stalls += 1
-                                        yield (f"\n⚠ 模型流静默超过 {_STALL_TIMEOUT:g}s，"
-                                               f"已中止本次尝试。\n")
+                                        if diag.retryable and self._stalls <= _STALL_EXTENSIONS:
+                                            # The server is still working (prefill
+                                            # progress observed): the silence is
+                                            # legitimate, not a dead stream —
+                                            # extend the wait instead of aborting.
+                                            yield ("\n⏳ 服务端正在处理请求（prefill "
+                                                   "推进中），静默看门狗延长等待…\n")
+                                            continue
+                                        yield f"\n⚠ {diag.message}\n"
                                         resp = self._active_resp
                                         if resp is not None:
                                             try:
                                                 await resp.cancel()
                                             except Exception:
                                                 pass
+                                        self._abort_server_request()
                                         if self._stalls > 2:
                                             self._run_failed = True
                                             self._run_error = (
-                                                "model stream stalled")
+                                                f"model stream stalled: {diag.reason}")
                                             return
                                         raise RuntimeError(
-                                            "model stream stalled")
+                                            f"model stream stalled: {diag.reason}")
                                     stripped = t.lstrip()
                                     if not (t.startswith("💭")
                                             or stripped.startswith("🔧")
@@ -1176,6 +1436,10 @@ Rules:
                         if self._needs_write_nudge(files_before, text):
                             yield ("\n⚠ 本轮没有创建任何文件，正在要求模型补写"
                                    "交付物…\n")
+                            if self._trace is not None:
+                                # 补写也是一次独立的模型调用：记录其输入。
+                                self._trace.append(self.id, self.title, "user",
+                                                   "prompt", text=_NUDGE_PROMPT)
                             try:
                                 async with asyncio.timeout(_TURN_TIMEOUT):
                                     async for tok in self._chat_once(_NUDGE_PROMPT):
@@ -1212,6 +1476,16 @@ Rules:
                                 yield ("\n⏳ 服务端仍在处理被中止的请求，"
                                        "等待槽位释放…\n")
                                 state = await self._wait_for_slot_release()
+                            if state == "zombie":
+                                # A processing slot whose progress never moves
+                                # will never release itself; only an operator
+                                # restart frees it. Report instead of retrying.
+                                self._run_failed = True
+                                self._run_error = "zombie request holds server slot"
+                                yield ("\n⚠ 服务端槽位被僵尸请求冻结（进度长期"
+                                       "停滞），无法自动恢复；请重启 :9000 "
+                                       "模型服务后重试。\n")
+                                return
                             if state == "down":
                                 self._run_failed = True
                                 self._run_error = str(ex)
@@ -1263,6 +1537,14 @@ Rules:
             "usage": self._usage_snapshot(),
         }
         self.run_seq += 1
+        if self._trace is not None:
+            # 全局轨迹：本轮模型调用的结束记录（停止原因 / 用量 / 耗时）。
+            self._trace.append(
+                self.id, self.title, "system", "turn_end",
+                text=(f"stop_reason={self._stop_reason_value()} "
+                      f"reply_len={reply_len} "
+                      f"duration={round(now - started, 1)}s "
+                      f"usage={json.dumps(self._usage_snapshot(), ensure_ascii=False)}"))
         self._record_task_run(reply_len, now)
 
     # ---- framework messaging helper -------------------------------------
@@ -1517,6 +1799,11 @@ Rules:
                             summary = await resp.text()
                         finally:
                             self._active_resp = None
+                        if self._trace is not None:
+                            self._trace.append(self.id, self.title, "user",
+                                               "prompt", text=prompt)
+                            self._trace.append(self.id, self.title, "assistant",
+                                               "text", text=summary or "")
                         break
                     except asyncio.CancelledError:
                         raise

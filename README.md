@@ -31,3 +31,14 @@ python -m demo.main --live
 
 `google.antigravity` 是**单 Agent** 基础设施；link.md 的**多 Agent 编排**（任务 DAG、编排器、交付物验收、消息协议、依赖死锁、全局收敛）SDK 均不直接提供。
 详见 `link.md` 第六节「SDK 逐项对应关系」。
+
+
+# 1. 启动代理（已验证在跑，监听 127.0.0.1:9000）
+MAAS_API_KEY="XXX" 
+MAAS_MODEL="spark-x2.6" python3 demo/maas_proxy.py
+
+# 2. demo 零改动，只需环境变量
+IDEA_BACKEND=openai OPENAI_BASE_URL=http://localhost:9000/v1 OPENAI_MODEL=spark-x2.6 python3 demo/server.py
+
+
+IDEA_BACKEND=openai OPENAI_BASE_URL=http://localhost:9000/v1 OPENAI_MODEL=spark-x2.6 python3 canvas/run.py
