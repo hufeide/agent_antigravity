@@ -1075,10 +1075,13 @@ Rules:
             # The harness drops the model's reasoning; the maas proxy mirrors
             # it to a side-channel log — consume it into the transcript now.
             await self._consume_reasoning()
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             # Cancelled from the OUTSIDE (orchestrator cancel_all, shutdown,
-            # graph interruption): still tell the backend to halt, otherwise the
-            # harness finishes the turn in the background after we've stopped.
+            # graph interruption) OR GeneratorExit from aclose() when the WS
+            # disconnects and produce() closes the generator. Either way:
+            # tell the backend to halt FIRST, otherwise the harness keeps
+            # calling the LLM in the background after the egg shows "stopped",
+            # and late chunks leak into the transcript via hooks.
             await self.halt()
             raise
         finally:
@@ -1490,12 +1493,12 @@ Rules:
                                                    "推进中），静默看门狗延长等待…\n")
                                             continue
                                         yield f"\n⚠ {diag.message}\n"
-                                        resp = self._active_resp
-                                        if resp is not None:
-                                            try:
-                                                await resp.cancel()
-                                            except Exception:
-                                                pass
+                                        # halt() sends halt_request to the harness (which
+                                        # actually stops the model) and cancels the SDK-side
+                                        # reader with a timeout; then ask the proxy to close
+                                        # its upstream connection so the model stops
+                                        # generating even if the harness misses the disconnect.
+                                        await self.halt()
                                         self._abort_server_request()
                                         if self._stalls > 2:
                                             self._run_failed = True

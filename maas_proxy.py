@@ -22,6 +22,10 @@ Endpoints
   POST /v1/chat/completions  -> forward to MAAS_UPSTREAM with auth, relay stream
   GET  /v1/models            -> list the configured model (SDK auto-detect probe)
   GET  /health               -> liveness
+  GET  /slots                -> in-flight request snapshot (for the stall watchdog)
+  POST /abort                -> close all in-flight upstream connections so the
+                                model stops generating immediately (resp.cancel()
+                                on the SDK side only stops the local reader)
 
 Environment
 -----------
@@ -65,6 +69,11 @@ _STRIP_ON_400 = ("stream_options",)
 # "dead stream" / "server down" when talking to this proxy.
 _INFLIGHT = 0
 _PROGRESS = 0
+# Active upstream responses, so POST /abort can close them server-side and
+# actually stop the upstream model from generating (resp.cancel() on the SDK
+# side only stops the local reader — the proxy's upstream connection stays
+# open and the model keeps streaming).
+_ACTIVE_UPSTREAMS: set = set()
 
 # Side-channel reasoning log. The local harness (Go binary) silently drops the
 # model's reasoning_content on the openai stream, so the demo cannot see the
@@ -265,6 +274,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
             await resp.prepare(request)
             _INFLIGHT += 1
             _PROGRESS += 1
+            _ACTIVE_UPSTREAMS.add(up)
             # Heartbeat: keep /slots progress advancing while a request is in
             # flight, so the watchdog treats long silent gaps during upstream
             # generation as slow_prefill (extend) rather than zombie (abort).
@@ -289,6 +299,7 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
                     _write_reasoning_log(req_key, "".join(reasoning_buf))
                     reasoning_buf.clear()
 
+            client_gone = False
             try:
                 async for chunk in up.content.iter_any():
                     _PROGRESS += 1
@@ -312,10 +323,16 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
                             await resp.write(new_line.encode("utf-8") + b"\n")
                         except Exception:
                             # Client disconnected mid-stream (watchdog abort /
-                            # user halt): stop relaying gracefully instead of
-                            # logging a traceback.
+                            # user halt): stop relaying AND close the upstream
+                            # connection so the model stops generating.
+                            # resp.cancel() only stops the SDK-side reader;
+                            # without this the proxy keeps pulling from upstream
+                            # and late chunks leak into the transcript.
+                            client_gone = True
                             buf = b""
                             break
+                    if client_gone:
+                        break
                 if buf:
                     try:
                         new_line, reasoning, has_content = _rewrite_sse_payload(
@@ -332,9 +349,23 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
                     except Exception:
                         pass
                 _flush_reasoning()  # trailing reasoning after the body
+            except Exception:
+                # Upstream connection closed (aborted via /abort, or reset by
+                # the server mid-stream): stop relaying. The model stopped
+                # generating — treat as end of stream.
+                client_gone = True
             finally:
                 hb.cancel()
                 _INFLIGHT -= 1
+                _ACTIVE_UPSTREAMS.discard(up)
+            if client_gone:
+                # Close the upstream connection so the model stops generating
+                # immediately. release() alone returns the connection to the
+                # pool but does not signal the server to stop generating.
+                try:
+                    up.close()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 await up.release()
             except Exception:  # noqa: BLE001
@@ -378,6 +409,25 @@ async def handle_slots(request: web.Request) -> web.Response:
     return web.json_response([_slots_snapshot()])
 
 
+async def handle_abort(request: web.Request) -> web.Response:
+    """Abort all in-flight upstream requests.
+
+    resp.cancel() on the SDK side only stops the local reader; the proxy's
+    connection to the upstream model server stays open and the model keeps
+    generating (a "zombie"). Closing those upstream connections here stops
+    the model and releases the /slots slot so the egg can restart cleanly.
+    """
+    aborted = 0
+    for up in list(_ACTIVE_UPSTREAMS):
+        try:
+            up.close()
+            aborted += 1
+        except Exception:  # noqa: BLE001
+            pass
+    _ACTIVE_UPSTREAMS.clear()
+    return web.json_response({"aborted": aborted})
+
+
 async def handle_models(request: web.Request) -> web.Response:
     return web.json_response({
         "object": "list",
@@ -402,6 +452,7 @@ def main() -> None:
     app = web.Application()
     app.router.add_post("/v1/chat/completions", handle_chat)
     app.router.add_get("/slots", handle_slots)
+    app.router.add_post("/abort", handle_abort)
     app.router.add_get("/v1/models", handle_models)
     app.router.add_get("/health", handle_health)
     print(f"[maas-proxy] {HOST}:{PORT} -> {UPSTREAM} (model={MODEL})", flush=True)
