@@ -29,6 +29,34 @@ async def lifespan(app: FastAPI):
     await canvas.shutdown()
 
 
+async def _hydrate_egg_transcripts(canvas: Canvas, ws: WebSocket):
+    """Rebuild empty egg transcripts from the SDK's persisted conversations.
+
+    Eggs loaded from canvas.json may carry an empty transcript (the session was
+    saved before the transcript was captured, or an interrupted run never
+    reached the end-of-graph save). Starting the egg resumes its SDK
+    conversation via the saved conversation_id + save_dir; the SDK's step
+    history is replayed into the transcript (egg._ensure_started does this),
+    and the rebuilt transcript is pushed to the UI as another `history`
+    message (applyHistory replaces the panel content).
+    """
+    async def _one(egg):
+        if egg.transcript:
+            return
+        try:
+            await egg._ensure_started()
+        except Exception:
+            return
+        if egg.transcript:
+            try:
+                await ws.send_json({"type": "history", "eggId": egg.id,
+                                    "transcript": egg.transcript})
+            except Exception:
+                pass
+
+    await asyncio.gather(*(_one(e) for e in list(canvas.eggs.values())))
+
+
 app = FastAPI(lifespan=lifespan)
 
 
@@ -432,8 +460,20 @@ async def _dispatch(msg: dict, ws: WebSocket, canvas: Canvas):
                                         "transcript": e.transcript})
                 await ws.send_json({"type": "history", "eggId": "commander",
                                     "transcript": canvas.commander.transcript})
+                # Eggs restored with an empty transcript (canvas.json saved
+                # before their transcript was captured, or an interrupted run
+                # never reached the end-of-graph save) can still be rebuilt
+                # from the SDK's persisted conversation: start the egg (which
+                # resumes the LLM session via the saved conversation_id) and
+                # replay the SDK step history into the transcript, then push
+                # the rebuilt transcript to the UI.
+                asyncio.create_task(_hydrate_egg_transcripts(canvas, ws))
             except Exception as ex:
                 await ws.send_json({"type": "error", "message": f"load failed: {ex}"})
+                # Clear the canvas so the frontend doesn't show stale eggs from
+                # the previous session — those eggs no longer exist server-side,
+                # so review/file buttons would 404.
+                await ws.send_json({"type": "eggs", "eggs": [], "edges": []})
 
     elif t == "newSession":
         # Persist the current session (if any) then open a fresh empty session.

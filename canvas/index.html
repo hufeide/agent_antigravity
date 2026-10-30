@@ -186,6 +186,7 @@
   .st-pill.running{color:#7fd1ff;background:#12202c;border-color:#2c5a7a;}
   .st-pill.blocked,.st-pill.waiting_approval,.st-pill.pending{color:#e3c07a;background:#2a2410;border-color:#5a4a1a;}
   .st-pill.planned{color:#8b98a9;background:#12161f;}
+  .st-pill.ran{color:#b0a8ff;background:#1e1a30;border-color:#4a3f7a;}
   .st-meta{font-size:11px;color:var(--muted);margin-top:4px;line-height:1.5;}
   .st-reason{font-size:11px;color:#ff9b95;margin-top:4px;}
   .st-acts{display:flex;gap:6px;margin-top:6px;}
@@ -1189,6 +1190,7 @@ function renderStatus(d){
          + '</div>';
     html += '<div class="st-meta">验收 ' + (t.acceptance === true ? '通过' : (t.acceptance === false ? '失败' : '未评'))
          + ' · 复命 ' + (t.report_submitted ? '是' : '否')
+         + (t.ran_and_reported ? ' · <span class="st-pill ran">已运行</span>' : '')
          + ' · 产物 ' + (t.artifacts || []).length
          + (t.missing && t.missing.length ? ' · 缺失 ' + esc(t.missing.join(',')) : '')
          + '</div>';

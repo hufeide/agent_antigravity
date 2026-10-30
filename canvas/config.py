@@ -163,6 +163,29 @@ def is_stream_stall_error(err):
     return "stalled" in low or "静默" in low or "stream timeout" in low
 
 
+def is_upstream_stream_error(err):
+    """True when the upstream (Spark MaaS) dropped the stream mid-generation.
+
+    The upstream has a ~2-minute streaming timeout: a model turn that takes
+    longer gets an HTTP/2 GOAWAY and the connection drops mid-stream. The
+    harness retries and reports "received 1000 (OK);then sent 1000 (OK)" /
+    "unexpected EOF". These are transient upstream limits, not a dead server —
+    the egg should heal the conversation (the aborted turn may have been
+    persisted as an error step) and retry, rather than reporting a fatal
+    failure.
+    """
+    if err is None:
+        return False
+    low = str(err).lower()
+    for marker in ("unexpected eof", "received 1000", "goaway",
+                   "network issue connecting", "connection reset",
+                   "broken pipe", "stream ended prematurely",
+                   "stream closed", "connection aborted"):
+        if marker in low:
+            return True
+    return False
+
+
 def compaction_config():
     """Per-backend compaction policy (keeps small context windows healthy)."""
     from google.antigravity import types

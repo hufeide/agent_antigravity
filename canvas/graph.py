@@ -19,6 +19,7 @@ import json
 import os
 import inspect
 import re
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -568,6 +569,9 @@ class Canvas:
         return
 
     async def shutdown(self):
+        # Persist in-memory state (transcripts, synced conversation_ids,
+        # commander transcript) before the harness processes go away.
+        self.save()
         for e in self.eggs.values():
             try:
                 await e.stop()
@@ -743,6 +747,8 @@ Rules:
                     _abort_server_request()
                     resolve_task.cancel()
                     raise
+                # 规划器的思考：harness 丢弃 reasoning_content，代理侧通道已镜像。
+                await self._consume_reasoning_log("planner", "规划器")
                 texts = "".join(
                     c.text for c in raw_chunks
                     if isinstance(c, types.Text))
@@ -970,6 +976,58 @@ Rules:
             peers.append((role, other.title, path))
         return peers
 
+    def _completion_summary_text(self, egg, limit=2000):
+        """One egg's completion summary for downstream eggs / the commander.
+
+        Prefer the summary file the egg is instructed to write
+        (COMPLETION_SUMMARY.md in its worktree root). Fall back to the egg's
+        latest assistant reply when the file is missing (e.g. sessions created
+        before this rule existed).
+        """
+        path = Path(egg.worktree) / "COMPLETION_SUMMARY.md"
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            if text:
+                return text[:limit]
+        except Exception:
+            pass
+        return (egg.context_summary(limit=limit) or "").strip()
+
+    async def _consume_reasoning_log(self, key, title):
+        """Record model reasoning mirrored by the maas proxy.
+
+        The openai backend streams through the local harness (a Go binary)
+        which silently drops ``reasoning_content`` — the SDK never surfaces a
+        Thought chunk. The maas proxy mirrors the reasoning to
+        ``sessions/.reasoning/<key>.log``; poll for it (the proxy flushes
+        right after the upstream stream ends) and record the thinking into
+        the commander transcript + global trace.
+        """
+        path = (Path(__file__).resolve().parent.parent / "sessions"
+                / ".reasoning" / f"{key}.log")
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                await asyncio.sleep(0.1)
+                continue
+            if text:
+                try:
+                    # Consume: truncate so the next call only sees new text.
+                    path.write_text("", encoding="utf-8")
+                except Exception:
+                    pass
+                self.commander.transcript.append({
+                    "role": "assistant", "kind": "thought", "text": text,
+                    "ts": datetime.datetime.now().isoformat(
+                        timespec="milliseconds"),
+                })
+                if self._trace is not None:
+                    self._trace.append(key, title, "assistant", "thought",
+                                       text=text)
+            return
+
     def _peer_note(self, peers):
         if not peers:
             return ""
@@ -984,6 +1042,24 @@ Rules:
             "- 上述目录仅供读取，禁止写入或修改；你的交付物必须写到你自己的"
             "工作区根目录。",
         ]
+        # 上游完成摘要：下游蛋开工前必须先读，据此决定如何完成自己的任务，
+        # 绝不要重复上游已完成的工作，也绝不要执行属于其他蛋的任务。
+        upstream = [(title, path) for role, title, path in peers
+                    if role == "upstream"]
+        if upstream:
+            lines.append("【上游蛋的完成摘要（开始工作前必须先读）】")
+            lines.append("规则：先阅读下列上游蛋的完成摘要，据此决定如何完成你自己的"
+                         "任务；绝不要重复上游蛋已经完成的工作，绝不要执行属于"
+                         "其他蛋的任务；最后也要写你自己的完成摘要。")
+            by_path = {str(e.worktree): e for e in self.eggs.values()}
+            for title, path in upstream:
+                oegg = by_path.get(path)
+                text = self._completion_summary_text(oegg) if oegg is not None else ""
+                if text:
+                    lines.append(f"- 《{title}》完成摘要：\n{text}")
+                else:
+                    lines.append(f"- 《{title}》：未找到完成摘要文件，"
+                                 f"请直接读取其交付物：{path}")
         return "\n".join(lines)
 
     # ---- message bus policy / commander inbox (link.md 一.4) ----
@@ -1055,6 +1131,8 @@ Rules:
         )
         task.report_submitted = False
         task.report_payload = {}
+        # Clear the 已运行并上报 marker so a re-run re-executes this egg.
+        task.metadata.pop("ran_and_reported", None)
         task.runs = []
         # Keep the version high-water mark: clearing the artifact list must not
         # make the next run restart at v1 (link.md 二.5 artifact versioning).
@@ -1074,24 +1152,46 @@ Rules:
             task.acceptance.passed = None
             task.acceptance.evidence = []
 
-    def _build_orchestrator(self, ids, reset=False):
+    def _build_orchestrator(self, ids, reset=False, force_ids=None,
+                           skip_complete=False):
         orch = Orchestrator(
             max_concurrency=self.max_concurrency,
             max_retries=self.max_retries,
             retry_backoff=self.retry_backoff,
         )
         task_of = self._tasks_for(ids)
+        force = set(force_ids or ())
+        skipped = []
+        registered = set()
         for task in task_of.values():
+            already_complete = completion.evaluate_task_completed(task).complete
+            if skip_complete and already_complete:
+                # 已运行并上报总指挥：跳过该蛋（即使被显式请求）。
+                # 运行计划重跑时只执行未完成的蛋；下游任务把它视为满足的
+                # "success" 依赖继续推进。不重置、不注册、不派发。
+                skipped.append(task.task_id)
+                continue
             if reset:
-                self._reset_task(task)
-                self._store.save(task)
+                if task.task_id not in force and already_complete:
+                    # A prerequisite that is already complete keeps its
+                    # status/artifacts/report: resetting it would wipe the
+                    # completion evidence, and the scheduler would re-run
+                    # done work every time a downstream task executes.
+                    pass
+                else:
+                    self._reset_task(task)
+                    self._store.save(task)
             orch.register(task)
+            registered.add(task.task_id)
         for v in self.edges.values():
             if v["from"] in task_of and v["to"] in task_of:
                 # An edge is drawn left-to-right (source -> target), so the
                 # TARGET is downstream and depends on the SOURCE: from runs
-                # first, to starts once from is finished.
-                orch.add_dependency(v["to"], v["from"], condition="success")
+                # first, to starts once from is finished. Only wire the
+                # dependency when the downstream egg is registered (not
+                # skipped); a skipped parent is implicitly satisfied.
+                if v["to"] in registered:
+                    orch.add_dependency(v["to"], v["from"], condition="success")
         return orch, task_of
 
     # ---- ordering via the demo Orchestrator (link.md 二.7) ----
@@ -1161,10 +1261,20 @@ Rules:
                 if reason:
                     yield {"k": "say", "egg": "commander",
                            "text": f"[{egg.title}] ❌ 未完成原因：{reason}"}
+        # Persist this egg's progress (transcript + synced conversation_id) as
+        # soon as it finishes, so an interrupted run / crash never loses the
+        # whole session's history to the next end-of-graph save.
+        self.save()
 
     # ---- concurrent graph execution ----
-    async def _run_graph(self, eggs, instruction_fn, ctx_fn):
-        """Run targets and their prerequisites; gate downstream tasks on TaskCompleted."""
+    async def _run_graph(self, eggs, instruction_fn, ctx_fn, skip_complete=True):
+        """Run targets and their prerequisites; gate downstream tasks on TaskCompleted.
+
+        skip_complete=True (default): eggs that already ran and reported to the
+        commander are skipped (not reset, not dispatched) — re-running the DAG
+        only executes eggs that have not completed yet. Pass skip_complete=False
+        to force a full re-run (e.g. the user explicitly selected eggs to re-run).
+        """
         requested_ids = {egg.id for egg in eggs if egg.id in self.eggs}
         try:
             ordered_ids = self._execution_ids(requested_ids)
@@ -1198,7 +1308,11 @@ Rules:
                     yield {"k": "say", "egg": "commander",
                            "text": f"⛔ 跳过「{egg.title}」：前置任务未完成：{', '.join(unmet)}"}
                     continue
-                async for ev in self._run_egg(egg, instruction_for(egg), ctx_fn(egg)):
+                note = self._peer_note(self._peer_dirs(egg))
+                ctx = ctx_fn(egg) or ""
+                if note:
+                    ctx = f"{ctx}\n\n{note}".strip()
+                async for ev in self._run_egg(egg, instruction_for(egg), ctx):
                     yield ev
                 report = getattr(egg, "last_completion_report", None)
                 if report is not None and getattr(report, "complete", False):
@@ -1206,7 +1320,26 @@ Rules:
             return
 
         q: asyncio.Queue = asyncio.Queue()
-        orch, task_of = self._build_orchestrator(ordered_ids, reset=True)
+        # requested_ids are the explicitly requested eggs (new eggs from a
+        # replan, user-selected eggs, commander targets). skip_complete=True
+        # means eggs that already ran-and-reported are skipped (not reset,
+        # not dispatched) even when requested; only genuinely incomplete work
+        # is re-executed.
+        orch, task_of = self._build_orchestrator(ordered_ids, reset=True,
+                                                 force_ids=requested_ids,
+                                                 skip_complete=skip_complete)
+        # Eggs in ordered_ids that were NOT registered = skipped as
+        # already-run-and-reported. Report them so the operator sees why
+        # they were not executed.
+        registered_ids = {t.task_id for t in orch.all()}
+        skipped_ids = [tid for tid in ordered_ids if tid not in registered_ids]
+        if skip_complete and skipped_ids:
+            titles = [self.eggs[tid].title for tid in skipped_ids
+                      if tid in self.eggs]
+            if titles:
+                yield {"k": "say", "egg": "commander",
+                       "text": (f"⏭ 跳过 {len(titles)} 个已运行并上报的蛋："
+                                + "、".join(titles))}
 
         def _event(name, task, **kw):
             if name in ("started", "retry", "failed", "finished", "timeout", "canceled"):
@@ -1358,6 +1491,7 @@ Rules:
         egg_lines = []
         for egg in self.eggs.values():
             state, artifacts, report_submitted, blocked_reason, complete = "not run", [], False, "", False
+            ran_and_reported = False
             if FRAMEWORK_OK:
                 try:
                     task = self._store.load(egg.id)
@@ -1367,13 +1501,29 @@ Rules:
                         report_submitted = bool(task.report_submitted)
                         blocked_reason = str(task.metadata.get("blocked_reason") or "")
                         complete = completion.evaluate_task_completed(task).complete
+                        ran_and_reported = bool(task.metadata.get("ran_and_reported"))
                 except Exception as exc:  # noqa: BLE001
                     state = f"state unavailable: {exc}"
             egg_lines.append(
                 f"- id={egg.id}; title={egg.title}; status={state}; TaskCompleted={complete}; "
-                f"report_submitted={report_submitted}; artifacts={artifacts[:6]}; "
+                f"report_submitted={report_submitted}; ran_and_reported={ran_and_reported}; "
+                f"artifacts={artifacts[:16]}; "
                 f"blocked_reason={blocked_reason[:180]}; prompt={egg.prompt[:160]!r}")
         egg_ctx = "\n".join(egg_lines) if egg_lines else "(画布上还没有任何蛋)"
+        # 各蛋完成摘要：总指挥在决定 replan 之前必须先读每个蛋的完成摘要，
+        # 避免把已经完成的工作再规划一遍、或与蛋的工作重复。
+        summary_lines = []
+        for egg in self.eggs.values():
+            # NOTE: do NOT name this variable `text` — it would shadow the
+            # function parameter (the operator's message) and leave `text`
+            # holding the LAST egg's summary (often "") by the time
+            # agent.chat(text) runs, which the SDK rejects with
+            # "chat() requires a non-empty message string".
+            summary = self._completion_summary_text(egg)
+            if summary:
+                summary_lines.append(f"- 《{egg.title}》完成摘要：\n{summary}")
+        if summary_lines:
+            egg_ctx += "\n\n【各蛋完成摘要（replan 前必读）】\n" + "\n".join(summary_lines)
         config = build_agent_config(
             f"""You are the 总指挥 (commander) of an IdeaCanvas multi-agent project.
 
@@ -1395,6 +1545,7 @@ CRITICAL rules:
 - Each new task may depend on AT MOST ONE prerequisite, and the combined graph must keep a UNIQUE path to every node: never create a diamond where a task is reachable two ways (e.g. A->C and A->B->C). Chain prerequisites in order instead.
 - Questions like "需要产物吗" or "进度如何" are answer actions, not run actions.
 - Never infer completion from a status string alone; use TaskCompleted and artifacts/report fields.
+- Before choosing "replan", read every egg's completion summary above: never propose work an egg has already completed or is doing — describe only genuinely missing or corrected work.
 - Include brief reasoning and a concise reply in the JSON.
 - Output EXACTLY ONE JSON object matching the schema. No Markdown, no code fences, no explanations outside the JSON.""",
             response_schema=COMMANDER_DECISION_SCHEMA, tools=(),
@@ -1424,6 +1575,8 @@ CRITICAL rules:
                 raise
             if not isinstance(data, dict):
                 data = _extract_json(await response.text())
+        # 总指挥的思考：harness 丢弃 reasoning_content，代理侧通道已镜像。
+        await self._consume_reasoning_log("commander", "总指挥")
         if not isinstance(data, dict):
             raise ValueError("commander decision must be a JSON object")
         action = data.get("action")
@@ -1576,7 +1729,7 @@ CRITICAL rules:
         msg = f"✅ 已创建 {len(created_by_title)} 个新蛋"
         if removed:
             msg += f"，移除 {len(removed)} 个旧蛋（{', '.join(removed)}）"
-        msg += "；依赖已校验，开始执行新任务。"
+        msg += "；依赖已校验，新蛋已就绪。"
         if dropped:
             placeholder_to_title = {v: k for k, v in placeholder.items()}
 
@@ -1585,12 +1738,8 @@ CRITICAL rules:
 
             pruned = "；".join(f"{_label(p)}→{_label(t)}" for p, t in dropped)
             msg += f"\n🔗 已收敛为唯一到达路径（每节点仅一条上游链），移除重复上游边：{pruned}"
+        msg += "\n⏸ 新蛋不会自动运行——由你决定何时运行（点「运行计划」或勾选蛋后运行）。"
         yield {"k": "say", "egg": "commander", "text": msg}
-
-        async for ev in self._run_graph(
-                list(created_by_title.values()), lambda egg: text,
-                lambda egg: self.neighbor_context(egg.id)):
-            yield ev
 
     async def commander_run(self, text, targets):
         """Route commander chat safely; never execute every egg on decision failure."""
@@ -1647,7 +1796,8 @@ CRITICAL rules:
                    "text": f"→ 向 {len(target_eggs)} 个相关蛋传递信息；前置任务将先行执行并验收。"}
             async for ev in self._run_graph(
                     target_eggs, lambda egg: instructions.get(egg.title, text),
-                    lambda egg: self.neighbor_context(egg.id)):
+                    lambda egg: self.neighbor_context(egg.id),
+                    skip_complete=False):
                 yield ev
             yield {"k": "say", "egg": "commander", "text": "🏁 信息传递流程结束。"}
             yield {"k": "end"}
@@ -1660,7 +1810,7 @@ CRITICAL rules:
             return
         yield {"k": "say", "egg": "commander", "text": f"🚀 执行：{text}"}
         async for ev in self._run_graph(
-                eggs, lambda egg: text, lambda egg: self.neighbor_context(egg.id)):
+                eggs, lambda egg: egg.prompt, lambda egg: self.neighbor_context(egg.id)):
             yield ev
         yield {"k": "say", "egg": "commander", "text": "🏁 运行流程结束。"}
         yield {"k": "end"}
@@ -1676,7 +1826,8 @@ CRITICAL rules:
                "text": f"🚀 运行所选任务及其前置任务（所选 {len(eggs)} 个，并发上限 {self.max_concurrency}）"}
         async for ev in self._run_graph(
                 eggs, lambda egg: egg.prompt,
-                lambda egg: self.neighbor_context(egg.id)):
+                lambda egg: self.neighbor_context(egg.id),
+                skip_complete=False):
             yield ev
         yield {"k": "say", "egg": "commander", "text": "🏁 运行结束。"}
         yield {"k": "end"}
@@ -1740,6 +1891,7 @@ CRITICAL rules:
                 "required": task.required,
                 "confirmed": task.confirmed,
                 "report_submitted": task.report_submitted,
+                "ran_and_reported": bool(task.metadata.get("ran_and_reported")),
                 "blocked_reason": task.metadata.get("blocked_reason"),
                 "attempt": int(task.metadata.get("attempt", 1)),
                 "acceptance": task.acceptance.passed if task.acceptance else None,
@@ -1817,20 +1969,78 @@ CRITICAL rules:
         }
         try:
             (self.session_dir / "canvas.json").write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+                json.dumps(data, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8")
+        except Exception as exc:
+            # Never swallow a canvas save silently: a serialization failure here
+            # would make the whole DAG vanish from disk with no signal (the
+            # replan case: new eggs/edges created in memory, canvas.json never
+            # updated). Log loudly so it is visible in the server output.
+            print(f"[canvas] ⚠ canvas.json save failed: {exc!r}")
         if FRAMEWORK_OK:
             try:
                 self._store.save_json(str(self.session_dir / "tasks.json"))
                 self._approvals.save_json(str(self.session_dir / "approvals.json"))
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[canvas] ⚠ tasks/approvals save failed: {exc!r}")
+
+    @staticmethod
+    def _recover_conversation_id(egg):
+        """Recover an egg's persisted SDK conversation id when canvas.json lost it.
+
+        The SDK stores each conversation as agent_data/<conversation_id>.db; the
+        db's trajectory_metadata_blob references the egg's worktree as its first
+        file:// entry. A session whose canvas.json was saved before the egg's
+        conversation_id was synced (e.g. an interrupted run) can therefore still
+        resume its conversation instead of starting a fresh one.
+        """
+        import sqlite3
+        ad = Path(egg.session_dir) / "agent_data"
+        if not ad.is_dir():
+            return None
+        wt = str(egg.worktree)
+        best = None
+        try:
+            for db in sorted(ad.glob("*.db")):
+                try:
+                    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                    row = con.execute(
+                        "SELECT data FROM trajectory_metadata_blob "
+                        "WHERE id='main'").fetchone()
+                    con.close()
+                except Exception:
+                    continue
+                blob = row[0] if row and row[0] else b""
+                first = re.search(rb"file://([^:\s]+)", blob)
+                first_path = first.group(1).decode() if first else ""
+                if first_path != wt:
+                    continue
+                # Pick the most complete db when several map to this egg.
+                steps = None
+                try:
+                    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+                    steps = con.execute(
+                        "SELECT COUNT(*) FROM steps").fetchone()[0]
+                    con.close()
+                except Exception:
+                    pass
+                if best is None or (steps or 0) > (best[1] or 0):
+                    best = (db.stem, steps)
+        except Exception:
+            return None
+        return best[0] if best else None
 
     async def load(self, sid):
         d = SESSIONS_DIR / sid
         if not d.is_dir():
             raise FileNotFoundError(sid)
+        # Validate canvas.json BEFORE clearing eggs: if the session has no
+        # canvas.json (empty/partial session), a failed load would leave
+        # canvas.eggs empty while the frontend still shows the previous
+        # session's eggs — clicking review/file buttons would 404.
+        canvas_path = d / "canvas.json"
+        if not canvas_path.exists():
+            raise FileNotFoundError(f"canvas.json not found for {sid}")
         self.session_id = sid
         self.session_dir = d
         # 加载该会话的全局模型调用轨迹（JSONL），供前端「全局」标签展示。
@@ -1838,7 +2048,7 @@ CRITICAL rules:
         self._trace.load()
         self.eggs.clear()
         self.edges.clear()
-        data = json.loads((d / "canvas.json").read_text(encoding="utf-8"))
+        data = json.loads(canvas_path.read_text(encoding="utf-8"))
         if FRAMEWORK_OK:
             self._bind_session(sid, d)
         for spec in data.get("eggs", []):
@@ -1852,6 +2062,12 @@ CRITICAL rules:
                 trace=self._trace,
             )
             self.eggs[spec["id"]] = egg
+            if not egg.conversation_id:
+                # canvas.json may have been saved before the egg's first model
+                # turn synced its conversation_id (interrupted run); recover the
+                # persisted SDK conversation from agent_data/*.db so the egg can
+                # resume instead of starting fresh and orphaning its history.
+                egg.conversation_id = self._recover_conversation_id(egg)
             restored = spec.get("transcript") or []
             if restored:
                 egg.transcript = restored

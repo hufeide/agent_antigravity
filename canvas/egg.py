@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .config import (WORKTREE_ROOT, BACKEND, quiet_sdk_start,
                      backend_options, is_corrupt_conversation_error,
-                     is_stream_stall_error)
+                     is_stream_stall_error, is_upstream_stream_error)
 from .reasoning import (set_reasoning_capture, reasoning_capture_state,
                         thought_text)
 from .. import acceptance, agent_runtime, completion, infrastructure, messaging, models
@@ -375,8 +375,10 @@ Rules:
 1. **Code tasks:** If programming is genuinely required, implement actual source files in the workspace and run them to verify. Report only what you actually did and observed.
 2. **Non-code tasks:** Complete writing, analysis, research, planning, and other general tasks directly. Do not invent code unnecessarily.
 3. **Deliverables:** Your final reply must clearly state the result. For code, list files and run instructions; otherwise, present the result directly. Save any written deliverable as a Markdown file in the workspace root, never in `agent_data/`.
-4. Coordinate with connected eggs only when instructed.
-5. Be concise and truthful.
+4. **Read upstream summaries first:** Before starting, read the completion summaries of your upstream eggs (they are provided in your task context). Base your approach on what they have already delivered; NEVER redo work they have already completed, and NEVER perform work that belongs to another egg. Only do YOUR task.
+5. **Write a completion summary:** Before finishing, write your completion summary to `COMPLETION_SUMMARY.md` in your workspace root (never in `agent_data/`). It must cover: (1) what you did; (2) key deliverables and file paths; (3) verification results; (4) decisions you made; (5) caveats or limitations. Your final reply must also state the result and summarize this summary, so the commander and downstream eggs can read it.
+6. Coordinate with connected eggs only when instructed.
+7. Be concise and truthful.
 """
         )
         # Only keep the minimal SWE toolset (write/run code) — drop the default
@@ -788,6 +790,52 @@ Rules:
         else:
             self._record("assistant", "thought", text=text)
 
+    async def _consume_reasoning(self, nonblocking=False):
+        """Record the model's reasoning captured by the maas proxy.
+
+        The openai backend streams through the local harness (a Go binary)
+        which silently drops the model's ``reasoning_content`` — the SDK
+        never surfaces a Thought chunk (verified: delta.reasoning / delta.
+        thinking / extra_content.* all produce steps with empty thinking).
+        The maas proxy mirrors the reasoning to
+        ``sessions/.reasoning/<egg_id>.log`` — flushed SEGMENT-wise right
+        before the first body-text chunk so the egg can record thoughts IN
+        STREAM ORDER (before the body text they belong to).
+
+        With nonblocking=True (called inside the chunk loop) read whatever
+        the proxy has already flushed without waiting; otherwise poll briefly
+        for the trailing segment the proxy lands at stream end.
+        """
+        path = (Path(__file__).resolve().parent.parent / "sessions"
+                / ".reasoning" / f"{self.id}.log")
+        if nonblocking:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                return
+            if text:
+                try:
+                    # Consume: truncate so the next read only sees new text.
+                    path.write_text("", encoding="utf-8")
+                except Exception:
+                    pass
+                self._record_thought(text)
+            return
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+            except FileNotFoundError:
+                await asyncio.sleep(0.05)
+                continue
+            if text:
+                try:
+                    path.write_text("", encoding="utf-8")
+                except Exception:
+                    pass
+                self._record_thought(text)
+            return
+
     def _record_tool_call(self, source, name, args):
         """Record a tool call once, whichever SDK surface reported it first.
 
@@ -926,6 +974,11 @@ Rules:
         self._active_resp = resp
         try:
             async for chunk in resp.chunks:
+                # The proxy lands each reasoning segment right before the
+                # body text it belongs to — consume it BEFORE processing the
+                # chunk so thought entries appear in stream order (before the
+                # body text), not after the whole turn.
+                await self._consume_reasoning(nonblocking=True)
                 self._record_chunk(chunk)
                 t = _chunk_to_text(chunk)
                 if t:
@@ -939,6 +992,9 @@ Rules:
                 self._record("tool", "tool_result",
                              result="（本后端不回传工具结果：工具在服务端执行，"
                                     "结果直接进入模型上下文；产物见本蛋工作目录）")
+            # The harness drops the model's reasoning; the maas proxy mirrors
+            # it to a side-channel log — consume it into the transcript now.
+            await self._consume_reasoning()
         except asyncio.CancelledError:
             # Cancelled from the OUTSIDE (orchestrator cancel_all, shutdown,
             # graph interruption): still tell the backend to halt, otherwise the
@@ -1714,6 +1770,11 @@ Rules:
 
             task.report_submitted = bool(
                 task_status == models.TaskStatus.SUCCESS and passed)
+            # Marker: 已运行并上报总指挥 — set only when the egg ran and its
+            # report passed the completion rule. Used by _run_graph to skip
+            # already-run eggs on a re-run of the DAG. Cleared by _reset_task.
+            if task.report_submitted:
+                task.metadata["ran_and_reported"] = True
             if not task.report_submitted and "blocked_reason" not in task.metadata:
                 task.metadata["blocked_reason"] = (
                     task.acceptance.evidence[-1]
